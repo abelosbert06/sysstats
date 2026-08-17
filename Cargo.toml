@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "shared-types",
+    "backend-api",
+    "frontend-app",
+]

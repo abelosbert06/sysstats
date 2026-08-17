@@ -1,0 +1,6 @@
+[application]
+name = "frontend-app"
+default_platform = "desktop"
+
+[web.app]
+title = "System Telemetry"

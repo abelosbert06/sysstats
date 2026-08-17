@@ -1,0 +1,1 @@
+INSERT OR IGNORE INTO users (id, email) VALUES ('local-dev-user-id', 'dev@example.com'); INSERT OR IGNORE INTO devices (id, user_id, name, auth_token) VALUES ('local-dev-device-id', 'local-dev-user-id', 'My Local Mac', 'dev_token');

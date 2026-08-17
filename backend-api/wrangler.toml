@@ -1,0 +1,17 @@
+name = "backend-api"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-01-01"
+
+[build]
+command = "cargo install worker-build && worker-build --release"
+
+
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sys_stats_db"
+database_id = "1ab1a579-511f-44b9-b58c-52af8fd96b92"
+
+[[kv_namespaces]]
+binding = "LIVE_METRICS"
+id = "ffc25bf917d344fca112d4aa90e2c09d"

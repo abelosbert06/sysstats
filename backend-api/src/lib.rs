@@ -143,8 +143,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if req.method() == Method::Options {
         let mut resp = Response::empty()?;
         resp.headers_mut().set("Access-Control-Allow-Origin", "*")?;
-        resp.headers_mut().set("Access-Control-Allow-Headers", "Authorization, Content-Type")?;
+        resp.headers_mut().set("Access-Control-Allow-Headers", "*")?;
         resp.headers_mut().set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")?;
+        resp.headers_mut().set("Access-Control-Max-Age", "86400")?;
         return Ok(resp);
     }
 
@@ -555,9 +556,13 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             Response::ok("Marked as read")
         });
         
-    let mut resp = router.run(req, env).await?;
+    let res = router.run(req, env).await;
+    let mut resp = match res {
+        Ok(r) => r,
+        Err(e) => Response::error(format!("Internal Error: {}", e), 500)?,
+    };
     resp.headers_mut().set("Access-Control-Allow-Origin", "*")?;
-    resp.headers_mut().set("Access-Control-Allow-Headers", "Authorization, Content-Type")?;
+    resp.headers_mut().set("Access-Control-Allow-Headers", "*")?;
     resp.headers_mut().set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")?;
     Ok(resp)
 }

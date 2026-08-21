@@ -434,21 +434,54 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let notify_email = if req_data.notify_email.unwrap_or(true) { 1 } else { 0 };
             let notify_browser = if req_data.notify_browser.unwrap_or(true) { 1 } else { 0 };
 
-            let res = d1.prepare("INSERT INTO alert_rules (id, user_id, device_id, metric_type, threshold_value, cooldown_seconds, notify_email, notify_browser) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
-                .bind(&[
-                    rule_id.clone().into(),
-                    user.id.into(),
-                    req_data.device_id.map(Into::into).unwrap_or(wasm_bindgen::JsValue::NULL.into()),
-                    req_data.metric_type.into(),
-                    (req_data.threshold_value as f64).into(),
-                    cooldown.into(),
-                    notify_email.into(),
-                    notify_browser.into(),
-                ])?
+            let email_to_store = user.email.clone().unwrap_or_else(|| format!("{}@placeholder.com", user.id));
+            let _ = d1.prepare("INSERT INTO users (id, email) VALUES (?1, ?2) ON CONFLICT(id) DO UPDATE SET email = ?2")
+                .bind(&[user.id.clone().into(), email_to_store.clone().into()])?
                 .run().await;
 
-            if res.is_err() {
-                return Response::error("Failed to create alert rule", 500);
+            let res = if let Some(ref did) = req_data.device_id {
+                if !did.is_empty() {
+                    d1.prepare("INSERT INTO alert_rules (id, user_id, device_id, metric_type, threshold_value, cooldown_seconds, notify_email, notify_browser) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
+                        .bind(&[
+                            rule_id.clone().into(),
+                            user.id.into(),
+                            did.clone().into(),
+                            req_data.metric_type.into(),
+                            (req_data.threshold_value as f64).into(),
+                            cooldown.into(),
+                            notify_email.into(),
+                            notify_browser.into(),
+                        ])?
+                        .run().await
+                } else {
+                    d1.prepare("INSERT INTO alert_rules (id, user_id, device_id, metric_type, threshold_value, cooldown_seconds, notify_email, notify_browser) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7)")
+                        .bind(&[
+                            rule_id.clone().into(),
+                            user.id.into(),
+                            req_data.metric_type.into(),
+                            (req_data.threshold_value as f64).into(),
+                            cooldown.into(),
+                            notify_email.into(),
+                            notify_browser.into(),
+                        ])?
+                        .run().await
+                }
+            } else {
+                d1.prepare("INSERT INTO alert_rules (id, user_id, device_id, metric_type, threshold_value, cooldown_seconds, notify_email, notify_browser) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7)")
+                    .bind(&[
+                        rule_id.clone().into(),
+                        user.id.into(),
+                        req_data.metric_type.into(),
+                        (req_data.threshold_value as f64).into(),
+                        cooldown.into(),
+                        notify_email.into(),
+                        notify_browser.into(),
+                    ])?
+                    .run().await
+            };
+
+            if let Err(e) = res {
+                return Response::error(format!("Failed to create alert rule: {}", e), 500);
             }
 
             Response::from_json(&serde_json::json!({ "id": rule_id }))

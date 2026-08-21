@@ -879,16 +879,22 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                                                 .send()
                                                 .await;
 
-                                            if let Ok(resp) = res {
-                                                if resp.status().is_success() {
-                                                    target_metric_alert.set(None);
-                                                    if let Ok(res2) = client.get("https://backend-api.krequiem.workers.dev/api/alerts/rules").bearer_auth(&t).send().await {
-                                                        if let Ok(data) = res2.json::<Vec<AlertRule>>().await {
-                                                            alert_rules.set(data);
+                                            match res {
+                                                Ok(resp) => {
+                                                    if resp.status().is_success() {
+                                                        target_metric_alert.set(None);
+                                                        if let Ok(res2) = client.get("https://backend-api.krequiem.workers.dev/api/alerts/rules").bearer_auth(&t).send().await {
+                                                            if let Ok(data) = res2.json::<Vec<AlertRule>>().await {
+                                                                alert_rules.set(data);
+                                                            }
                                                         }
+                                                    } else {
+                                                        let txt = resp.text().await.unwrap_or_else(|_| "Unknown server error".to_string());
+                                                        sheet_error.set(format!("Server error: {}", txt));
                                                     }
-                                                } else {
-                                                    sheet_error.set("Failed to set alert rule".to_string());
+                                                }
+                                                Err(e) => {
+                                                    sheet_error.set(format!("Network error: {}", e));
                                                 }
                                             }
                                         });

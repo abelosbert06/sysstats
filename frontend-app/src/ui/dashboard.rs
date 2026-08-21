@@ -209,8 +209,10 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                 "svg text {{ fill: #aaaaaa !important; font-size: 10px !important; font-family: -apple-system, monospace !important; }}"
                 "svg line {{ stroke: #333333 !important; }}"
                 "svg path.domain {{ stroke: #444444 !important; }}"
-                "svg {{ display: block; max-height: 100%; max-width: 100%; }}"
-                ".chart-wrapper > div {{ width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }}"
+                "svg:not(.dx-chart-line) {{ display: inline-block; }}"
+                "svg.dx-chart-line {{ display: block !important; width: 100% !important; height: 100% !important; max-height: 100% !important; max-width: 100% !important; }}"
+                ".chart-wrapper {{ position: relative; width: 100%; height: 100%; overflow: hidden; }}"
+                ".chart-wrapper > div {{ width: 100% !important; height: 100% !important; display: flex; align-items: center; justify-content: center; }}"
                 ".dx-line-path {{ vector-effect: non-scaling-stroke !important; stroke-width: 2px !important; }}"
                 ".network-io-chart .dx-line-0 path, .disk-io-chart .dx-line-0 path {{ stroke: #00bfff !important; }}"
                 ".network-io-chart .dx-line-1 path, .disk-io-chart .dx-line-1 path {{ stroke: rgb(180, 40, 40) !important; }}"
@@ -248,6 +250,19 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                     .dashboard-container > div:last-child {{ border-bottom: none; }}
                     .chart-wrapper {{ min-height: 140px; }}
                 }}"
+            }
+
+            script {
+                "
+                const observer = new MutationObserver((mutations) => {{
+                    document.querySelectorAll('svg.dx-chart-line').forEach(svg => {{
+                        if (svg.getAttribute('preserveAspectRatio') !== 'none') {{
+                            svg.setAttribute('preserveAspectRatio', 'none');
+                        }}
+                    }});
+                }});
+                observer.observe(document.body, {{ childList: true, subtree: true }});
+                "
             }
 
             // In-App Alert Toast Notification

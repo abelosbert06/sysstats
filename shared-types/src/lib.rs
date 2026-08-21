@@ -33,3 +33,41 @@ pub struct SystemMetricPayload {
 pub struct BatchMetricRequest {
     pub metrics: Vec<SystemMetricPayload>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AlertRule {
+    pub id: String,
+    pub user_id: String,
+    pub device_id: Option<String>,
+    pub metric_type: String, // "cpu", "memory", "disk", "temperature"
+    pub threshold_value: f32,
+    pub cooldown_seconds: u32,
+    pub notify_email: bool,
+    pub notify_browser: bool,
+    pub last_triggered: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAlertRuleRequest {
+    pub device_id: Option<String>,
+    pub metric_type: String,
+    pub threshold_value: f32,
+    pub cooldown_seconds: Option<u32>,
+    pub notify_email: Option<bool>,
+    pub notify_browser: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AlertEvent {
+    pub id: String,
+    pub user_id: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub metric_type: String,
+    pub metric_value: f32,
+    pub threshold_value: f32,
+    pub message: String,
+    pub created_at: String,
+    pub read_at: Option<String>,
+}

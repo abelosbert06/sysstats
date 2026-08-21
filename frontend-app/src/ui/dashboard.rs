@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 use dioxus_charts::LineChart;
-use shared_types::SystemMetricPayload;
+use shared_types::{AlertEvent, AlertRule, CreateAlertRuleRequest, SystemMetricPayload};
 
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::time::{sleep, Duration};
@@ -18,7 +18,7 @@ enum ActiveTab {
     Network,
 }
 
-#[derive(serde::Deserialize, Clone)]
+#[derive(serde::Deserialize, Clone, PartialEq)]
 struct DeviceRecord {
     id: String,
     name: String,
@@ -46,6 +46,22 @@ pub fn Dashboard(props: DashboardProps) -> Element {
     let mut editing_device_id = use_signal(|| String::new());
     let mut edit_device_name = use_signal(|| String::new());
     let mut create_error = use_signal(|| String::new());
+
+    // Alerts and Notifications State
+    let mut alert_rules = use_signal(|| Vec::<AlertRule>::new());
+    let mut alert_history = use_signal(|| Vec::<AlertEvent>::new());
+    let mut is_alert_modal_open = use_signal(|| false);
+    let mut is_history_modal_open = use_signal(|| false);
+    let mut active_toast = use_signal(|| Option::<AlertEvent>::None);
+
+    // Form state for creating an alert rule
+    let mut new_rule_metric = use_signal(|| "cpu".to_string());
+    let mut new_rule_threshold = use_signal(|| "85".to_string());
+    let mut new_rule_device_id = use_signal(|| "".to_string());
+    let mut new_rule_cooldown = use_signal(|| "900".to_string());
+    let mut new_rule_email = use_signal(|| true);
+    let mut new_rule_browser = use_signal(|| true);
+    let mut rule_form_error = use_signal(|| String::new());
 
     // Fetch Devices
     let token = props.token.clone();
@@ -90,69 +106,89 @@ pub fn Dashboard(props: DashboardProps) -> Element {
         }
     });
 
+    // Fetch Alert Rules & History Poll Loop (every 5 seconds)
+    let token3 = props.token.clone();
+    use_future(move || {
+        let t = token3.clone();
+        async move {
+            let client = reqwest::Client::new();
+            loop {
+                // Fetch Rules
+                if let Ok(res) = client.get("https://backend-api.krequiem.workers.dev/api/alerts/rules").bearer_auth(&t).send().await {
+                    if let Ok(data) = res.json::<Vec<AlertRule>>().await {
+                        alert_rules.set(data);
+                    }
+                }
+
+                // Fetch Alert History
+                if let Ok(res) = client.get("https://backend-api.krequiem.workers.dev/api/alerts/history").bearer_auth(&t).send().await {
+                    if let Ok(events) = res.json::<Vec<AlertEvent>>().await {
+                        // Check if there is an unread alert
+                        if let Some(first_unread) = events.iter().find(|e| e.read_at.is_none()) {
+                            let current_toast = active_toast.read().clone();
+                            if current_toast.as_ref().map(|e| e.id.as_str()) != Some(&first_unread.id) {
+                                active_toast.set(Some(first_unread.clone()));
+                            }
+                        }
+                        alert_history.set(events);
+                    }
+                }
+
+                sleep(Duration::from_secs(5)).await;
+            }
+        }
+    });
+
     let metrics = metrics_sig.read();
     let current_tab = *active_tab.read();
 
     let latest = metrics.last();
-    let latest_uptime = latest.map(|m| m.uptime_sec).unwrap_or(0);
     let latest_procs = latest.map(|m| m.running_processes).unwrap_or(0);
     let latest_mem_used = latest.map(|m| m.memory_used_mb).unwrap_or(0);
     let latest_mem_total = latest.map(|m| m.memory_total_mb).unwrap_or(0);
-    let latest_mem_avail = latest_mem_total.saturating_sub(latest_mem_used);
     let latest_cpu = latest.map(|m| m.cpu_usage_pct).unwrap_or(0.0);
-    let latest_disk_used = latest.map(|m| m.disk_usage_pct).unwrap_or(0.0);
-    
-    // Sort processes based on active tab
-    let mut processes = latest.map(|m| m.processes.clone()).unwrap_or_default();
-    match current_tab {
-        ActiveTab::Cpu => processes.sort_by(|a, b| b.cpu_usage.partial_cmp(&a.cpu_usage).unwrap_or(std::cmp::Ordering::Equal)),
-        ActiveTab::Memory => processes.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes)),
-        ActiveTab::Disk => processes.sort_by(|a, b| (b.disk_read_bytes + b.disk_written_bytes).cmp(&(a.disk_read_bytes + a.disk_written_bytes))),
-        ActiveTab::Network => (), // Network stats per-process unavailable, keep CPU sort or leave as is
-    }
 
-    let (
-        time_labels,
-        cpu_series,
-        mem_series,
-        disk_series,
-        rx_series,
-        tx_series,
-        max_rx,
-        max_tx,
-        max_disk_r,
-        max_disk_w,
-    ) = match &*metrics {
-        list if !list.is_empty() => {
-            let labels: Vec<String> = list.iter().map(|m| {
-                let sec = m.timestamp_sec % 86400;
-                format!("{:02}:{:02}:{:02}", sec / 3600, (sec % 3600) / 60, sec % 60)
-            }).collect();
+    let empty_vec = Vec::new();
+    let processes = latest.map(|m| &m.processes).unwrap_or(&empty_vec);
 
-            let cpu_s: Vec<f32> = list.iter().map(|m| m.cpu_usage_pct).collect();
-            let mem_s: Vec<f32> = list.iter().map(|m| m.memory_used_mb as f32).collect();
-            let disk_s: Vec<f32> = list.iter().map(|m| m.disk_usage_pct).collect();
-            let rx_s: Vec<f32> = list.iter().map(|m| m.network_rx_bytes_sec as f32).collect();
-            let tx_s: Vec<f32> = list.iter().map(|m| m.network_tx_bytes_sec as f32).collect();
-            let disk_r_s: Vec<f32> = list.iter().map(|m| m.disk_read_bytes_sec as f32).collect();
-            let disk_w_s: Vec<f32> = list.iter().map(|m| m.disk_written_bytes_sec as f32).collect();
+    let time_labels: Vec<String> = metrics.iter().map(|m| {
+        let secs = m.timestamp_sec % 60;
+        let mins = (m.timestamp_sec / 60) % 60;
+        format!("{:02}:{:02}", mins, secs)
+    }).collect();
 
-            let m_rx = rx_s.iter().fold(0.0_f32, |a, &b| a.max(b));
-            let m_tx = tx_s.iter().fold(0.0_f32, |a, &b| a.max(b));
-            let m_dr = disk_r_s.iter().fold(0.0_f32, |a, &b| a.max(b));
-            let m_dw = disk_w_s.iter().fold(0.0_f32, |a, &b| a.max(b));
-
-            (labels, vec![cpu_s], vec![mem_s], vec![disk_r_s, disk_w_s], vec![rx_s], vec![tx_s], m_rx, m_tx, m_dr, m_dw)
+    let cpu_series: Vec<Vec<f32>> = vec![metrics.iter().map(|m| m.cpu_usage_pct).collect()];
+    let mem_series: Vec<Vec<f32>> = vec![metrics.iter().map(|m| {
+        if m.memory_total_mb > 0 {
+            (m.memory_used_mb as f32 / m.memory_total_mb as f32) * 100.0
+        } else {
+            0.0
         }
-        _ => {
-            let z = vec![vec![0.0]];
-            (vec!["00:00:00".to_string()], z.clone(), z.clone(), vec![vec![0.0], vec![0.0]], z.clone(), z.clone(), 0.0, 0.0, 0.0, 0.0)
-        }
-    };
+    }).collect()];
+
+    let disk_series: Vec<Vec<f32>> = vec![
+        metrics.iter().map(|m| m.disk_read_bytes_sec as f32 / 1024.0).collect(),
+        metrics.iter().map(|m| m.disk_written_bytes_sec as f32 / 1024.0).collect(),
+    ];
+
+    let rx_series: Vec<Vec<f32>> = vec![metrics.iter().map(|m| m.network_rx_bytes_sec as f32).collect()];
+    let tx_series: Vec<Vec<f32>> = vec![metrics.iter().map(|m| m.network_tx_bytes_sec as f32).collect()];
+
+    let max_disk_r = metrics.iter().map(|m| m.disk_read_bytes_sec as f32).fold(0.0f32, f32::max);
+    let max_disk_w = metrics.iter().map(|m| m.disk_written_bytes_sec as f32).fold(0.0f32, f32::max);
+    let max_rx = metrics.iter().map(|m| m.network_rx_bytes_sec as f32).fold(0.0f32, f32::max);
+    let max_tx = metrics.iter().map(|m| m.network_tx_bytes_sec as f32).fold(0.0f32, f32::max);
+
+    let selected_device_name = devices.read().iter()
+        .find(|d| d.id == *selected_device_id.read())
+        .map(|d| d.name.clone())
+        .unwrap_or_else(|| "My Device".to_string());
+
+    let unread_alerts_count = alert_history.read().iter().filter(|e| e.read_at.is_none()).count();
 
     rsx! {
         div {
-            style: "height: 100vh; width: 100vw; background-color: #1e1e1e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; display: flex; flex-direction: row; overflow: hidden;",
+            style: "height: 100vh; width: 100vw; background-color: #1e1e1e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; display: flex; flex-direction: row; overflow: hidden; position: relative;",
             style {
                 "* {{ box-sizing: border-box; }}"
                 "body {{ background-color: #1e1e1e; margin: 0; padding: 0; }}"
@@ -178,6 +214,8 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                 ".device-item.selected {{ background-color: #007aff; color: #fff; }}"
                 ".sidebar-overlay {{ display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.5); z-index: 90; }}"
                 ".hamburger-btn {{ display: none; background: none; border: none; color: #fff; font-size: 1.5rem; cursor: pointer; padding: 0.5rem; margin-right: 0.5rem; }}"
+                ".alert-toast {{ position: fixed; top: 1rem; right: 1rem; z-index: 9999; background: linear-gradient(135deg, #2c1212 0%, #1e1e1e 100%); border: 1px solid #ff4444; border-left: 4px solid #ff4444; color: #fff; padding: 1rem 1.25rem; border-radius: 8px; box-shadow: 0 10px 25px rgba(0,0,0,0.6); display: flex; align-items: center; gap: 1rem; max-width: 450px; animation: slideIn 0.3s ease; }}"
+                "@keyframes slideIn {{ from {{ transform: translateX(100%); opacity: 0; }} to {{ transform: translateX(0); opacity: 1; }} }}"
                 "@media (max-width: 768px) {{
                     .sidebar {{ position: fixed; top: 0; left: 0; height: 100vh; transform: translateX(-100%); }}
                     .sidebar.open {{ transform: translateX(0); }}
@@ -209,6 +247,36 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                 "
             }
 
+            // In-App Alert Toast Notification
+            if let Some(toast) = active_toast.read().clone() {
+                div {
+                    class: "alert-toast",
+                    div { style: "font-size: 1.5rem;", "⚠️" }
+                    div {
+                        style: "flex: 1;",
+                        div { style: "font-size: 0.75rem; font-weight: 700; color: #ff6666; text-transform: uppercase;", "Threshold Alert Triggered" }
+                        div { style: "font-size: 0.85rem; margin-top: 0.2rem; color: #eee;", "{toast.message}" }
+                    }
+                    button {
+                        style: "background: #333; border: 1px solid #555; color: #fff; border-radius: 4px; padding: 0.3rem 0.6rem; font-size: 0.75rem; cursor: pointer;",
+                        onclick: {
+                            let t = props.token.clone();
+                            let aid = toast.id.clone();
+                            move |_| {
+                                active_toast.set(None);
+                                let t = t.clone();
+                                let aid = aid.clone();
+                                spawn(async move {
+                                    let client = reqwest::Client::new();
+                                    let _ = client.post(format!("https://backend-api.krequiem.workers.dev/api/alerts/history/{}/read", aid)).bearer_auth(&t).send().await;
+                                });
+                            }
+                        },
+                        "Dismiss"
+                    }
+                }
+            }
+
             // Mobile Sidebar Overlay
             div {
                 class: if *is_sidebar_open.read() { "sidebar-overlay open" } else { "sidebar-overlay" },
@@ -219,430 +287,700 @@ pub fn Dashboard(props: DashboardProps) -> Element {
             div {
                 class: if *is_sidebar_open.read() { "sidebar open" } else { "sidebar" },
                 div {
-                    style: "padding: 1rem; border-bottom: 1px solid #111;",
-                    h2 { style: "margin: 0; font-size: 1rem; color: #fff;", "My Devices" }
+                    style: "padding: 1rem; border-bottom: 1px solid #111; display: flex; justify-content: space-between; align-items: center;",
+                    div {
+                        style: "font-weight: 600; font-size: 1rem; color: #fff;",
+                        "Activity Monitor"
+                    }
+                    button {
+                        style: "background: none; border: none; color: #888; cursor: pointer; font-size: 1.2rem; padding: 0.25rem;",
+                        onclick: move |_| props.on_logout.call(()),
+                        "🚪"
+                    }
                 }
+
                 div {
                     style: "flex: 1; overflow-y: auto; padding: 0.5rem;",
-                    for device in devices.read().iter() {
+                    for dev in devices.read().iter() {
                         div {
-                            key: "{device.id}",
-                            class: if selected_device_id.read().as_str() == device.id { "device-item selected" } else { "device-item" },
+                            key: "{dev.id}",
+                            class: if *selected_device_id.read() == dev.id { "device-item selected" } else { "device-item" },
                             onclick: {
-                                let id = device.id.clone();
-                                move |_| selected_device_id.set(id.clone())
-                            },
-                            if editing_device_id.read().as_str() == device.id {
-                                div {
-                                    style: "display: flex; flex-direction: column; gap: 0.5rem;",
-                                    input {
-                                        value: "{edit_device_name}",
-                                        oninput: move |evt| edit_device_name.set(evt.value()),
-                                        onclick: move |evt| evt.stop_propagation(),
-                                        style: "padding: 0.4rem; background-color: #1e1e1e; color: #fff; border: 1px solid #444; border-radius: 4px; outline: none; width: 100%; font-size: 0.8rem;",
-                                    }
-                                    div {
-                                        style: "display: flex; gap: 0.5rem;",
-                                        button {
-                                            style: "flex: 1; padding: 0.3rem; background-color: #333; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem;",
-                                            onclick: {
-                                                let t = props.token.clone();
-                                                let id = device.id.clone();
-                                                move |evt| {
-                                                    evt.stop_propagation();
-                                                    let new_name = edit_device_name.read().clone();
-                                                    if !new_name.is_empty() {
-                                                        let t = t.clone();
-                                                        let id = id.clone();
-                                                        spawn(async move {
-                                                            let client = reqwest::Client::new();
-                                                            let url = format!("https://backend-api.krequiem.workers.dev/api/devices/{}", id);
-                                                            if let Ok(_) = client.put(&url)
-                                                                .bearer_auth(&t)
-                                                                .json(&serde_json::json!({ "name": new_name }))
-                                                                .send().await 
-                                                            {
-                                                                // Fetch updated devices list
-                                                                if let Ok(res) = client.get("https://backend-api.krequiem.workers.dev/api/devices").bearer_auth(&t).send().await {
-                                                                    if let Ok(data) = res.json::<Vec<DeviceRecord>>().await {
-                                                                        devices.set(data);
-                                                                    }
-                                                                }
-                                                                editing_device_id.set(String::new());
-                                                            }
-                                                        });
-                                                    }
-                                                }
-                                            },
-                                            "Save"
-                                        }
-                                        button {
-                                            style: "flex: 1; padding: 0.3rem; background-color: transparent; color: #aaa; border: 1px solid #444; border-radius: 4px; cursor: pointer; font-size: 0.75rem;",
-                                            onclick: move |evt| {
-                                                evt.stop_propagation();
-                                                editing_device_id.set(String::new());
-                                            },
-                                            "Cancel"
-                                        }
-                                    }
+                                let id = dev.id.clone();
+                                move |_| {
+                                    selected_device_id.set(id.clone());
+                                    metrics_sig.set(Vec::new());
+                                    is_sidebar_open.set(false);
                                 }
-                            } else {
+                            },
+                            div {
+                                style: "display: flex; justify-content: space-between; align-items: center;",
+                                span { style: "font-weight: 500; font-size: 0.9rem;", "{dev.name}" }
                                 div {
-                                    style: "display: flex; justify-content: space-between; align-items: center; width: 100%;",
-                                    div { style: "font-weight: 500; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;", "{device.name}" }
-                                    div {
-                                        style: "display: flex; gap: 0.25rem;",
-                                        button {
-                                            style: "background: none; border: none; color: inherit; cursor: pointer; padding: 0.2rem; opacity: 0.7;",
-                                            title: "Rename",
-                                            onclick: {
-                                                let id = device.id.clone();
-                                                let name = device.name.clone();
-                                                move |evt| {
-                                                    evt.stop_propagation();
-                                                    edit_device_name.set(name.clone());
-                                                    editing_device_id.set(id.clone());
-                                                }
-                                            },
-                                            "✎"
-                                        }
-                                        button {
-                                            style: "background: none; border: none; color: #ff4444; cursor: pointer; padding: 0.2rem; opacity: 0.7;",
-                                            title: "Delete",
-                                            onclick: {
-                                                let t = props.token.clone();
-                                                let id = device.id.clone();
-                                                move |evt| {
-                                                    evt.stop_propagation();
-                                                    // In a real app, maybe confirm first. We just delete for simplicity.
-                                                    let t = t.clone();
-                                                    let id = id.clone();
-                                                    spawn(async move {
-                                                        let client = reqwest::Client::new();
-                                                        let url = format!("https://backend-api.krequiem.workers.dev/api/devices/{}", id);
-                                                        if let Ok(_) = client.delete(&url).bearer_auth(&t).send().await {
-                                                            // Fetch updated devices list
-                                                            if let Ok(res) = client.get("https://backend-api.krequiem.workers.dev/api/devices").bearer_auth(&t).send().await {
-                                                                if let Ok(data) = res.json::<Vec<DeviceRecord>>().await {
-                                                                    devices.set(data);
-                                                                    // Deselect if we deleted the selected one
-                                                                    if selected_device_id.read().as_str() == id {
-                                                                        if let Some(first) = devices.read().first() {
-                                                                            selected_device_id.set(first.id.clone());
+                                    style: "display: flex; gap: 0.4rem;",
+                                    button {
+                                        style: "background: none; border: none; color: #aaa; cursor: pointer; font-size: 0.8rem; padding: 0.2rem;",
+                                        onclick: {
+                                            let id = dev.id.clone();
+                                            let name = dev.name.clone();
+                                            move |evt| {
+                                                evt.stop_propagation();
+                                                editing_device_id.set(id.clone());
+                                                edit_device_name.set(name.clone());
+                                            }
+                                        },
+                                        "✏️"
+                                    }
+                                    button {
+                                        style: "background: none; border: none; color: #aaa; cursor: pointer; font-size: 0.8rem; padding: 0.2rem;",
+                                        onclick: {
+                                            let id = dev.id.clone();
+                                            let t = props.token.clone();
+                                            move |evt| {
+                                                evt.stop_propagation();
+                                                let id = id.clone();
+                                                let t = t.clone();
+                                                spawn(async move {
+                                                    let client = reqwest::Client::new();
+                                                    let url = format!("https://backend-api.krequiem.workers.dev/api/devices/{}", id);
+                                                    if let Ok(res) = client.delete(&url).bearer_auth(&t).send().await {
+                                                        if res.status().is_success() {
+                                                            if let Ok(res2) = client.get("https://backend-api.krequiem.workers.dev/api/devices").bearer_auth(&t).send().await {
+                                                                if let Ok(data) = res2.json::<Vec<DeviceRecord>>().await {
+                                                                    if *selected_device_id.read() == id {
+                                                                        if !data.is_empty() {
+                                                                            selected_device_id.set(data[0].id.clone());
                                                                         } else {
                                                                             selected_device_id.set(String::new());
                                                                         }
                                                                     }
+                                                                    devices.set(data);
                                                                 }
+                                                            }
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        },
+                                        "🗑️"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Sidebar Footer Action Buttons
+                div {
+                    style: "padding: 0.75rem; border-top: 1px solid #111; display: flex; flex-direction: column; gap: 0.5rem;",
+                    button {
+                        style: "width: 100%; padding: 0.6rem; background-color: #007aff; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 0.875rem; font-weight: 500;",
+                        onclick: move |_| {
+                            new_device_name.set(String::new());
+                            new_device_token.set(String::new());
+                            create_error.set(String::new());
+                            is_adding_device.set(true);
+                        },
+                        "+ Add Device"
+                    }
+                    button {
+                        style: "width: 100%; padding: 0.5rem; background-color: #2a2a2a; color: #ccc; border: 1px solid #444; border-radius: 6px; cursor: pointer; font-size: 0.8125rem;",
+                        onclick: move |_| is_alert_modal_open.set(true),
+                        "⚙️ Alert Rules"
+                    }
+                }
+            }
+
+            // Central Content Area
+            div {
+                style: "flex: 1; display: flex; flex-direction: column; overflow: hidden; background-color: #1e1e1e;",
+
+                // Top Header
+                header {
+                    class: "dashboard-header",
+                    style: "height: 60px; background-color: #252525; border-bottom: 1px solid #111; display: flex; align-items: center; justify-content: space-between; padding: 0 1rem; flex-shrink: 0;",
+                    div {
+                        class: "header-top",
+                        style: "display: flex; align-items: center;",
+                        button {
+                            class: "hamburger-btn",
+                            onclick: move |_| {
+                                let cur = *is_sidebar_open.read();
+                                is_sidebar_open.set(!cur);
+                            },
+                            "☰"
+                        }
+                        div {
+                            h2 { style: "margin: 0; font-size: 1.125rem; font-weight: 600; color: #fff;", "{selected_device_name}" }
+                            span { style: "font-size: 0.75rem; color: #888;", "Real-Time Telemetry Monitor" }
+                        }
+                    }
+
+                    // Center Tabs
+                    div {
+                        style: "display: flex; align-items: center; gap: 0.25rem; background-color: #1e1e1e; padding: 0.2rem; border-radius: 6px; border: 1px solid #333;",
+                        button {
+                            class: if current_tab == ActiveTab::Cpu { "tab-button active" } else { "tab-button" },
+                            onclick: move |_| active_tab.set(ActiveTab::Cpu),
+                            "CPU"
+                        }
+                        button {
+                            class: if current_tab == ActiveTab::Memory { "tab-button active" } else { "tab-button" },
+                            onclick: move |_| active_tab.set(ActiveTab::Memory),
+                            "Memory"
+                        }
+                        button {
+                            class: if current_tab == ActiveTab::Disk { "tab-button active" } else { "tab-button" },
+                            onclick: move |_| active_tab.set(ActiveTab::Disk),
+                            "Disk"
+                        }
+                        button {
+                            class: if current_tab == ActiveTab::Network { "tab-button active" } else { "tab-button" },
+                            onclick: move |_| active_tab.set(ActiveTab::Network),
+                            "Network"
+                        }
+                    }
+
+                    // Header Right Actions
+                    div {
+                        style: "display: flex; align-items: center; gap: 0.75rem;",
+                        button {
+                            style: "background: #1e1e1e; border: 1px solid #444; color: #fff; border-radius: 6px; padding: 0.35rem 0.75rem; font-size: 0.8125rem; cursor: pointer; display: flex; align-items: center; gap: 0.4rem;",
+                            onclick: move |_| is_history_modal_open.set(true),
+                            "🔔"
+                            span { "Alerts" }
+                            if unread_alerts_count > 0 {
+                                span {
+                                    style: "background: #ff4444; color: #fff; font-size: 0.7rem; font-weight: 700; padding: 0.1rem 0.4rem; border-radius: 10px;",
+                                    "{unread_alerts_count}"
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Main Area (Process Table)
+                main {
+                    style: "flex: 1; overflow: auto; background-color: #1e1e1e;",
+                    table {
+                        class: "process-table",
+                        thead {
+                            tr {
+                                th { "Process Name" }
+                                if current_tab == ActiveTab::Cpu {
+                                    th { "% CPU" }
+                                    th { "Memory" }
+                                } else if current_tab == ActiveTab::Memory {
+                                    th { "Memory" }
+                                    th { "% CPU" }
+                                } else if current_tab == ActiveTab::Disk {
+                                    th { "Bytes Written" }
+                                    th { "Bytes Read" }
+                                } else if current_tab == ActiveTab::Network {
+                                    th { "Sent Bytes" }
+                                    th { "Rcvd Bytes" }
+                                }
+                                th { class: "hide-on-mobile", "User" }
+                                th { class: "hide-on-mobile", "PID" }
+                            }
+                        }
+                        tbody {
+                            for proc in processes {
+                                tr {
+                                    td { style: "color: #ddd;", "{proc.name}" }
+                                    if current_tab == ActiveTab::Cpu {
+                                        td { "{proc.cpu_usage:.1}" }
+                                        td { "{proc.memory_bytes / 1024 / 1024} MB" }
+                                    } else if current_tab == ActiveTab::Memory {
+                                        td { "{proc.memory_bytes / 1024 / 1024} MB" }
+                                        td { "{proc.cpu_usage:.1}" }
+                                    } else if current_tab == ActiveTab::Disk {
+                                        td { "{proc.disk_written_bytes / 1024} KB" }
+                                        td { "{proc.disk_read_bytes / 1024} KB" }
+                                    } else if current_tab == ActiveTab::Network {
+                                        td { "0" }
+                                        td { "0" }
+                                    }
+                                    td { class: "hide-on-mobile", "{proc.user_id}" }
+                                    td { class: "hide-on-mobile", "{proc.pid}" }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Bottom Dashboard Panel
+                footer {
+                    class: "dashboard-footer",
+                    style: "height: 180px; background-color: #252525; border-top: 1px solid #111; display: flex; justify-content: center; align-items: center; flex-shrink: 0; padding: 1rem;",
+                    div {
+                        class: "dashboard-container",
+                        style: "display: flex; width: 100%; max-width: 900px; height: 100%; border: 1px solid #444; border-radius: 8px; background-color: #1e1e1e;",
+                        
+                        div {
+                            style: "flex: 1; padding: 1rem; border-right: 1px solid #444; display: flex; flex-direction: column; justify-content: center; gap: 0.5rem; font-size: 0.8125rem;",
+                            if current_tab == ActiveTab::Cpu {
+                                div { style: "display: flex; justify-content: space-between;", span { "System:" }, span { style: "color: rgb(180, 40, 40);", "{latest_cpu * 0.3:.2}%" } }
+                                div { style: "display: flex; justify-content: space-between;", span { "User:" }, span { style: "color: #00bfff;", "{latest_cpu * 0.7:.2}%" } }
+                                div { style: "display: flex; justify-content: space-between;", span { "Idle:" }, span { "{100.0 - latest_cpu:.2}%" } }
+                            } else if current_tab == ActiveTab::Memory {
+                                div { style: "display: flex; justify-content: space-between;", span { "Physical Memory:" }, span { "{latest_mem_total / 1024} GB" } }
+                                div { style: "display: flex; justify-content: space-between;", span { "Memory Used:" }, span { "{latest_mem_used / 1024} GB" } }
+                            } else if current_tab == ActiveTab::Disk {
+                                div { style: "display: flex; justify-content: space-between;", span { "Reads in/sec:" }, span { "{latest.map(|m| m.disk_read_bytes_sec / 1024).unwrap_or(0)} KB" } }
+                                div { style: "display: flex; justify-content: space-between;", span { "Writes out/sec:" }, span { "{latest.map(|m| m.disk_written_bytes_sec / 1024).unwrap_or(0)} KB" } }
+                            } else if current_tab == ActiveTab::Network {
+                                div { style: "display: flex; justify-content: space-between;", span { "Data received/sec:" }, span { style: "color: #00bfff;", "{latest.map(|m| m.network_rx_bytes_sec).unwrap_or(0)} B/s" } }
+                                div { style: "display: flex; justify-content: space-between;", span { "Data sent/sec:" }, span { style: "color: rgb(180, 40, 40);", "{latest.map(|m| m.network_tx_bytes_sec).unwrap_or(0)} B/s" } }
+                            }
+                        }
+
+                        div {
+                            style: "flex: 2; padding: 0.5rem; position: relative; overflow: hidden;",
+                            class: "chart-wrapper",
+                            if current_tab == ActiveTab::Cpu {
+                                span { style: "position: absolute; top: 0; width: 100%; text-align: center; font-size: 10px; color: #888; font-weight: 600;", "CPU LOAD" }
+                                LineChart { series: cpu_series.clone(), labels: time_labels.clone(), series_labels: vec!["CPU".into()], height: "100%".to_string(), width: "100%".to_string(), show_dots: false, show_grid: true, lowest: 0.0, highest: 100.0, class_chart_line: "dx-chart-line cpu-chart" }
+                            } else if current_tab == ActiveTab::Memory {
+                                span { style: "position: absolute; top: 0; width: 100%; text-align: center; font-size: 10px; color: #888; font-weight: 600;", "MEMORY PRESSURE" }
+                                LineChart { series: mem_series.clone(), labels: time_labels.clone(), series_labels: vec!["Mem".into()], height: "100%".to_string(), width: "100%".to_string(), show_dots: false, show_grid: true, lowest: 0.0, class_chart_line: "dx-chart-line mem-chart" }
+                            } else if current_tab == ActiveTab::Disk {
+                                span { style: "position: absolute; top: 0; width: 100%; text-align: center; font-size: 10px; color: #888; font-weight: 600;", "IO" }
+                                LineChart { series: vec![disk_series[0].clone(), disk_series[1].clone()], labels: time_labels.clone(), series_labels: vec!["Read".into(), "Write".into()], height: "100%".to_string(), width: "100%".to_string(), show_dots: false, show_grid: true, lowest: 0.0, class_chart_line: "dx-chart-line disk-io-chart" }
+                            } else if current_tab == ActiveTab::Network {
+                                span { style: "position: absolute; top: 0; width: 100%; text-align: center; font-size: 10px; color: #888; font-weight: 600;", "PACKETS" }
+                                LineChart { series: vec![rx_series[0].clone(), tx_series[0].clone()], labels: time_labels.clone(), series_labels: vec!["RX B/s".into(), "TX B/s".into()], height: "100%".to_string(), width: "100%".to_string(), show_dots: false, show_grid: true, lowest: 0.0, class_chart_line: "dx-chart-line network-io-chart" }
+                            }
+                        }
+
+                        div {
+                            style: "flex: 1; padding: 1rem; border-left: 1px solid #444; display: flex; flex-direction: column; justify-content: center; gap: 0.5rem; font-size: 0.8125rem;",
+                            if current_tab == ActiveTab::Cpu {
+                                div { style: "display: flex; justify-content: space-between;", span { "Threads:" }, span { "{latest_procs * 4}" } }
+                                div { style: "display: flex; justify-content: space-between;", span { "Processes:" }, span { "{latest_procs}" } }
+                            } else if current_tab == ActiveTab::Memory {
+                                div { style: "display: flex; justify-content: space-between;", span { "App Memory:" }, span { "{latest_mem_used / 1024 / 2} GB" } }
+                                div { style: "display: flex; justify-content: space-between;", span { "Wired Memory:" }, span { "{latest_mem_used / 1024 / 4} GB" } }
+                                div { style: "display: flex; justify-content: space-between;", span { "Compressed:" }, span { "{latest_mem_used / 1024 / 8} GB" } }
+                            } else if current_tab == ActiveTab::Disk {
+                                div { style: "display: flex; justify-content: space-between;", span { "Peak read rate:" }, span { "{max_disk_r / 1024.0:.0} KB/s" } }
+                                div { style: "display: flex; justify-content: space-between;", span { "Peak write rate:" }, span { "{max_disk_w / 1024.0:.0} KB/s" } }
+                            } else if current_tab == ActiveTab::Network {
+                                div { style: "display: flex; justify-content: space-between;", span { "Peak rx rate:" }, span { "{max_rx / 1024.0:.0} KB/s" } }
+                                div { style: "display: flex; justify-content: space-between;", span { "Peak tx rate:" }, span { "{max_tx / 1024.0:.0} KB/s" } }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Modal: Add Device
+            if *is_adding_device.read() {
+                div {
+                    style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-color: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 1000;",
+                    div {
+                        style: "background-color: #252525; padding: 2rem; border-radius: 8px; border: 1px solid #444; width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: 1rem;",
+                        h3 { style: "margin: 0; color: #fff;", "Add New Device" }
+                        if new_device_token.read().is_empty() {
+                            input {
+                                type: "text",
+                                placeholder: "Device Name (e.g. My Laptop)",
+                                value: "{new_device_name}",
+                                oninput: move |evt| new_device_name.set(evt.value()),
+                                style: "background-color: #1e1e1e; border: 1px solid #444; color: #fff; padding: 0.5rem; border-radius: 4px;",
+                            }
+                            if !create_error.read().is_empty() {
+                                div { style: "color: #ff4444; font-size: 0.75rem;", "{create_error}" }
+                            }
+                            button {
+                                style: "width: 100%; padding: 0.5rem; background-color: #007aff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.875rem;",
+                                onclick: {
+                                    let t = props.token.clone();
+                                    move |_| {
+                                        let name = new_device_name.read().clone();
+                                        if name.is_empty() {
+                                            create_error.set("Name cannot be empty".to_string());
+                                            return;
+                                        }
+                                        let t = t.clone();
+                                        spawn(async move {
+                                            let client = reqwest::Client::new();
+                                            let res = client.post("https://backend-api.krequiem.workers.dev/api/devices")
+                                                .bearer_auth(&t)
+                                                .json(&serde_json::json!({ "name": name }))
+                                                .send()
+                                                .await;
+                                            match res {
+                                                Ok(resp) => {
+                                                    if resp.status().is_success() {
+                                                        if let Ok(data) = resp.json::<serde_json::Value>().await {
+                                                            if let Some(tok) = data.get("auth_token").and_then(|v| v.as_str()) {
+                                                                new_device_token.set(tok.to_string());
+                                                            }
+                                                        }
+                                                    } else {
+                                                        create_error.set("Failed to create device".to_string());
+                                                    }
+                                                }
+                                                Err(e) => create_error.set(e.to_string()),
+                                            }
+                                        });
+                                    }
+                                },
+                                "Create"
+                            }
+                            button {
+                                style: "width: 100%; padding: 0.5rem; background-color: transparent; color: #aaa; border: 1px solid transparent; cursor: pointer; font-size: 0.875rem;",
+                                onclick: move |_| {
+                                    is_adding_device.set(false);
+                                    create_error.set(String::new());
+                                },
+                                "Cancel"
+                            }
+                        } else {
+                            div { style: "font-size: 0.75rem; color: #00bfff; font-weight: bold;", "Device Created!" }
+                            div { style: "font-size: 0.75rem; color: #ccc; margin-top: 0.5rem; line-height: 1.4;", "Install & start the background service on your machine:" }
+                            div { 
+                                style: "font-size: 0.7rem; color: #00ff88; font-family: monospace; word-break: break-all; background-color: #111; padding: 0.6rem; border-radius: 4px; margin-top: 0.5rem; border: 1px solid #333; user-select: all;", 
+                                "sys_stats service install --token {new_device_token}" 
+                            }
+                            div { style: "font-size: 0.68rem; color: #888; margin-top: 0.4rem; line-height: 1.3;", "Supports macOS (launchd), Linux (systemd / OpenRC), and Windows." }
+                            button {
+                                style: "width: 100%; padding: 0.5rem; background-color: #333; color: #fff; border: 1px solid #444; border-radius: 4px; cursor: pointer; font-size: 0.875rem; margin-top: 0.5rem;",
+                                onclick: {
+                                    let t = props.token.clone();
+                                    move |_| {
+                                        is_adding_device.set(false);
+                                        let t = t.clone();
+                                        spawn(async move {
+                                            let client = reqwest::Client::new();
+                                            if let Ok(res) = client.get("https://backend-api.krequiem.workers.dev/api/devices").bearer_auth(&t).send().await {
+                                                if let Ok(data) = res.json::<Vec<DeviceRecord>>().await {
+                                                    devices.set(data);
+                                                }
+                                            }
+                                        });
+                                    }
+                                },
+                                "Done"
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Modal: Rename Device
+            if !editing_device_id.read().is_empty() {
+                div {
+                    style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-color: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 1000;",
+                    div {
+                        style: "background-color: #252525; padding: 2rem; border-radius: 8px; border: 1px solid #444; width: 100%; max-width: 400px; display: flex; flex-direction: column; gap: 1rem;",
+                        h3 { style: "margin: 0; color: #fff;", "Rename Device" }
+                        input {
+                            type: "text",
+                            value: "{edit_device_name}",
+                            oninput: move |evt| edit_device_name.set(evt.value()),
+                            style: "background-color: #1e1e1e; border: 1px solid #444; color: #fff; padding: 0.5rem; border-radius: 4px;",
+                        }
+                        div {
+                            style: "display: flex; gap: 0.5rem;",
+                            button {
+                                style: "flex: 1; padding: 0.5rem; background-color: #007aff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.875rem;",
+                                onclick: {
+                                    let id = editing_device_id.read().clone();
+                                    let name = edit_device_name.read().clone();
+                                    let t = props.token.clone();
+                                    move |_| {
+                                        let id = id.clone();
+                                        let name = name.clone();
+                                        let t = t.clone();
+                                        spawn(async move {
+                                            let client = reqwest::Client::new();
+                                            let url = format!("https://backend-api.krequiem.workers.dev/api/devices/{}", id);
+                                            let _ = client.put(&url).bearer_auth(&t).json(&serde_json::json!({ "name": name })).send().await;
+                                            if let Ok(res) = client.get("https://backend-api.krequiem.workers.dev/api/devices").bearer_auth(&t).send().await {
+                                                if let Ok(data) = res.json::<Vec<DeviceRecord>>().await {
+                                                    devices.set(data);
+                                                }
+                                            }
+                                        });
+                                        editing_device_id.set(String::new());
+                                    }
+                                },
+                                "Save"
+                            }
+                            button {
+                                style: "flex: 1; padding: 0.5rem; background-color: transparent; color: #aaa; border: 1px solid transparent; cursor: pointer; font-size: 0.875rem;",
+                                onclick: move |_| editing_device_id.set(String::new()),
+                                "Cancel"
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Modal: Alert Rules Configuration
+            if *is_alert_modal_open.read() {
+                div {
+                    style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-color: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 1000;",
+                    div {
+                        style: "background-color: #252525; padding: 2rem; border-radius: 8px; border: 1px solid #444; width: 100%; max-width: 550px; max-height: 85vh; display: flex; flex-direction: column; gap: 1.25rem; overflow-y: auto;",
+                        div {
+                            style: "display: flex; justify-content: space-between; align-items: center;",
+                            h3 { style: "margin: 0; color: #fff;", "⚙️ Threshold Alert Rules" }
+                            button {
+                                style: "background: none; border: none; color: #aaa; cursor: pointer; font-size: 1.2rem;",
+                                onclick: move |_| is_alert_modal_open.set(false),
+                                "✕"
+                            }
+                        }
+
+                        // Existing Rules List
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 0.5rem;",
+                            div { style: "font-size: 0.8rem; font-weight: 600; color: #888; text-transform: uppercase;", "Active Rules" }
+                            if alert_rules.read().is_empty() {
+                                div { style: "font-size: 0.85rem; color: #666; font-style: italic;", "No threshold alert rules set yet. Add one below!" }
+                            }
+                            for rule in alert_rules.read().iter() {
+                                div {
+                                    key: "{rule.id}",
+                                    style: "background: #1e1e1e; border: 1px solid #333; padding: 0.75rem; border-radius: 6px; display: flex; justify-content: space-between; align-items: center;",
+                                    div {
+                                        div { style: "font-weight: 600; font-size: 0.9rem; color: #00bfff;", "{rule.metric_type.to_uppercase()} > {rule.threshold_value}%" }
+                                        div { style: "font-size: 0.75rem; color: #888; margin-top: 0.2rem;",
+                                            "Target: "
+                                            {
+                                                if let Some(did) = &rule.device_id {
+                                                    devices.read().iter().find(|d| &d.id == did).map(|d| d.name.clone()).unwrap_or_else(|| "Specific Device".to_string())
+                                                } else {
+                                                    "All Devices".to_string()
+                                                }
+                                            }
+                                            " • Cooldown: {rule.cooldown_seconds / 60}m"
+                                        }
+                                    }
+                                    button {
+                                        style: "background: #331111; border: 1px solid #662222; color: #ff6666; border-radius: 4px; padding: 0.3rem 0.6rem; font-size: 0.75rem; cursor: pointer;",
+                                        onclick: {
+                                            let rid = rule.id.clone();
+                                            let t = props.token.clone();
+                                            move |_| {
+                                                let rid = rid.clone();
+                                                let t = t.clone();
+                                                spawn(async move {
+                                                    let client = reqwest::Client::new();
+                                                    let url = format!("https://backend-api.krequiem.workers.dev/api/alerts/rules/{}", rid);
+                                                    let _ = client.delete(&url).bearer_auth(&t).send().await;
+                                                    if let Ok(res) = client.get("https://backend-api.krequiem.workers.dev/api/alerts/rules").bearer_auth(&t).send().await {
+                                                        if let Ok(data) = res.json::<Vec<AlertRule>>().await {
+                                                            alert_rules.set(data);
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        },
+                                        "Delete"
+                                    }
+                                }
+                            }
+                        }
+
+                        // Add Rule Form
+                        div {
+                            style: "border-top: 1px solid #333; padding-top: 1rem; display: flex; flex-direction: column; gap: 0.75rem;",
+                            div { style: "font-size: 0.8rem; font-weight: 600; color: #888; text-transform: uppercase;", "Create New Threshold Rule" }
+
+                            div {
+                                style: "display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;",
+                                div {
+                                    label { style: "font-size: 0.75rem; color: #aaa;", "Metric" }
+                                    select {
+                                        style: "width: 100%; background: #1e1e1e; border: 1px solid #444; color: #fff; padding: 0.4rem; border-radius: 4px; margin-top: 0.2rem;",
+                                        value: "{new_rule_metric}",
+                                        onchange: move |evt| new_rule_metric.set(evt.value()),
+                                        option { value: "cpu", "CPU Usage (%)" }
+                                        option { value: "memory", "Memory Usage (%)" }
+                                        option { value: "disk", "Disk Usage (%)" }
+                                        option { value: "temperature", "CPU Temperature (°C)" }
+                                    }
+                                }
+                                div {
+                                    label { style: "font-size: 0.75rem; color: #aaa;", "Threshold Value" }
+                                    input {
+                                        type: "number",
+                                        style: "width: 100%; background: #1e1e1e; border: 1px solid #444; color: #fff; padding: 0.4rem; border-radius: 4px; margin-top: 0.2rem;",
+                                        value: "{new_rule_threshold}",
+                                        oninput: move |evt| new_rule_threshold.set(evt.value()),
+                                    }
+                                }
+                            }
+
+                            div {
+                                label { style: "font-size: 0.75rem; color: #aaa;", "Target Device" }
+                                select {
+                                    style: "width: 100%; background: #1e1e1e; border: 1px solid #444; color: #fff; padding: 0.4rem; border-radius: 4px; margin-top: 0.2rem;",
+                                    value: "{new_rule_device_id}",
+                                    onchange: move |evt| new_rule_device_id.set(evt.value()),
+                                    option { value: "", "All Devices (Global)" }
+                                    for dev in devices.read().iter() {
+                                        option { value: "{dev.id}", "{dev.name}" }
+                                    }
+                                }
+                            }
+
+                            div {
+                                style: "display: flex; gap: 1rem; align-items: center;",
+                                label {
+                                    style: "font-size: 0.8rem; color: #ccc; display: flex; align-items: center; gap: 0.4rem; cursor: pointer;",
+                                    input {
+                                        type: "checkbox",
+                                        checked: *new_rule_email.read(),
+                                        onchange: move |_| {
+                                            let cur = *new_rule_email.read();
+                                            new_rule_email.set(!cur);
+                                        }
+                                    }
+                                    "Send Email Alert"
+                                }
+                                label {
+                                    style: "font-size: 0.8rem; color: #ccc; display: flex; align-items: center; gap: 0.4rem; cursor: pointer;",
+                                    input {
+                                        type: "checkbox",
+                                        checked: *new_rule_browser.read(),
+                                        onchange: move |_| {
+                                            let cur = *new_rule_browser.read();
+                                            new_rule_browser.set(!cur);
+                                        }
+                                    }
+                                    "Browser Popup Alert"
+                                }
+                            }
+
+                            if !rule_form_error.read().is_empty() {
+                                div { style: "color: #ff4444; font-size: 0.75rem;", "{rule_form_error}" }
+                            }
+
+                            button {
+                                style: "padding: 0.6rem; background-color: #007aff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.875rem; font-weight: 500; margin-top: 0.5rem;",
+                                onclick: {
+                                    let t = props.token.clone();
+                                    move |_| {
+                                        let thresh: f32 = match new_rule_threshold.read().parse() {
+                                            Ok(v) => v,
+                                            Err(_) => {
+                                                rule_form_error.set("Invalid threshold number".to_string());
+                                                return;
+                                            }
+                                        };
+                                        let metric = new_rule_metric.read().clone();
+                                        let dev_id = new_rule_device_id.read().clone();
+                                        let dev_opt = if dev_id.is_empty() { None } else { Some(dev_id) };
+                                        let cooldown: u32 = new_rule_cooldown.read().parse().unwrap_or(900);
+                                        let email_flag = *new_rule_email.read();
+                                        let browser_flag = *new_rule_browser.read();
+
+                                        let req = CreateAlertRuleRequest {
+                                            device_id: dev_opt,
+                                            metric_type: metric,
+                                            threshold_value: thresh,
+                                            cooldown_seconds: Some(cooldown),
+                                            notify_email: Some(email_flag),
+                                            notify_browser: Some(browser_flag),
+                                        };
+
+                                        let t = t.clone();
+                                        spawn(async move {
+                                            let client = reqwest::Client::new();
+                                            let res = client.post("https://backend-api.krequiem.workers.dev/api/alerts/rules")
+                                                .bearer_auth(&t)
+                                                .json(&req)
+                                                .send()
+                                                .await;
+
+                                            if let Ok(resp) = res {
+                                                if resp.status().is_success() {
+                                                    rule_form_error.set(String::new());
+                                                    if let Ok(res2) = client.get("https://backend-api.krequiem.workers.dev/api/alerts/rules").bearer_auth(&t).send().await {
+                                                        if let Ok(data) = res2.json::<Vec<AlertRule>>().await {
+                                                            alert_rules.set(data);
+                                                        }
+                                                    }
+                                                } else {
+                                                    rule_form_error.set("Failed to create alert rule".to_string());
+                                                }
+                                            }
+                                        });
+                                    }
+                                },
+                                "Add Threshold Rule"
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Modal: Notification History Feed
+            if *is_history_modal_open.read() {
+                div {
+                    style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-color: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 1000;",
+                    div {
+                        style: "background-color: #252525; padding: 2rem; border-radius: 8px; border: 1px solid #444; width: 100%; max-width: 500px; max-height: 80vh; display: flex; flex-direction: column; gap: 1rem;",
+                        div {
+                            style: "display: flex; justify-content: space-between; align-items: center;",
+                            h3 { style: "margin: 0; color: #fff;", "🔔 Alert Notifications" }
+                            button {
+                                style: "background: none; border: none; color: #aaa; cursor: pointer; font-size: 1.2rem;",
+                                onclick: move |_| is_history_modal_open.set(false),
+                                "✕"
+                            }
+                        }
+
+                        div {
+                            style: "flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.5rem;",
+                            if alert_history.read().is_empty() {
+                                div { style: "font-size: 0.85rem; color: #666; font-style: italic; text-align: center; padding: 2rem;", "No alert notifications yet." }
+                            }
+                            for event in alert_history.read().iter() {
+                                div {
+                                    key: "{event.id}",
+                                    style: format!(
+                                        "background: {}; border: 1px solid {}; padding: 0.75rem; border-radius: 6px; display: flex; justify-content: space-between; align-items: flex-start;",
+                                        if event.read_at.is_none() { "#2c1a1a" } else { "#1e1e1e" },
+                                        if event.read_at.is_none() { "#ff5555" } else { "#333" }
+                                    ),
+                                    div {
+                                        style: "flex: 1;",
+                                        div { style: "font-weight: 600; font-size: 0.85rem; color: #fff;", "{event.device_name} — {event.metric_type.to_uppercase()}" }
+                                        div { style: "font-size: 0.8rem; color: #ccc; margin-top: 0.2rem;", "{event.message}" }
+                                        div { style: "font-size: 0.7rem; color: #777; margin-top: 0.3rem;", "{event.created_at}" }
+                                    }
+                                    if event.read_at.is_none() {
+                                        button {
+                                            style: "background: #333; border: 1px solid #555; color: #ccc; border-radius: 4px; padding: 0.25rem 0.5rem; font-size: 0.7rem; cursor: pointer;",
+                                            onclick: {
+                                                let id = event.id.clone();
+                                                let t = props.token.clone();
+                                                move |_| {
+                                                    let id = id.clone();
+                                                    let t = t.clone();
+                                                    spawn(async move {
+                                                        let client = reqwest::Client::new();
+                                                        let _ = client.post(format!("https://backend-api.krequiem.workers.dev/api/alerts/history/{}/read", id)).bearer_auth(&t).send().await;
+                                                        if let Ok(res) = client.get("https://backend-api.krequiem.workers.dev/api/alerts/history").bearer_auth(&t).send().await {
+                                                            if let Ok(events) = res.json::<Vec<AlertEvent>>().await {
+                                                                alert_history.set(events);
                                                             }
                                                         }
                                                     });
                                                 }
                                             },
-                                            "×"
+                                            "Mark Read"
                                         }
                                     }
                                 }
                             }
                         }
-                    }
-                }
-                div {
-                    style: "padding: 1rem; border-top: 1px solid #111;",
-                    if !is_adding_device.read().clone() {
-                        button {
-                            style: "width: 100%; padding: 0.5rem; background-color: #333; color: #fff; border: 1px solid #444; border-radius: 4px; cursor: pointer; font-size: 0.875rem;",
-                            onclick: move |_| {
-                                is_adding_device.set(true);
-                                new_device_token.set(String::new());
-                            },
-                            "+ Add Device"
-                        }
-                    } else {
-                        div {
-                            style: "display: flex; flex-direction: column; gap: 0.5rem;",
-                            if new_device_token.read().is_empty() {
-                                if !create_error.read().is_empty() {
-                                    div {
-                                        style: "color: #ff4444; font-size: 0.8rem; margin-bottom: 0.5rem;",
-                                        "{create_error}"
-                                    }
-                                }
-                                input {
-                                    placeholder: "Device Name",
-                                    value: "{new_device_name}",
-                                    oninput: move |evt| new_device_name.set(evt.value()),
-                                    style: "padding: 0.5rem; background-color: #1e1e1e; color: #fff; border: 1px solid #444; border-radius: 4px; outline: none; width: 100%;",
-                                }
-                                button {
-                                    style: "width: 100%; padding: 0.5rem; background-color: #007aff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.875rem;",
-                                    onclick: {
-                                        let t = props.token.clone();
-                                        move |_| {
-                                            let name = new_device_name.read().clone();
-                                            if !name.is_empty() {
-                                                create_error.set(String::new());
-                                                let t = t.clone();
-                                                spawn(async move {
-                                                    let client = reqwest::Client::new();
-                                                    match client.post("https://backend-api.krequiem.workers.dev/api/devices")
-                                                        .bearer_auth(&t)
-                                                        .json(&serde_json::json!({ "name": name }))
-                                                        .send().await 
-                                                    {
-                                                        Ok(res) => {
-                                                            if res.status().is_success() {
-                                                                if let Ok(data) = res.json::<serde_json::Value>().await {
-                                                                    if let Some(auth_token) = data.get("auth_token").and_then(|v| v.as_str()) {
-                                                                        new_device_token.set(auth_token.to_string());
-                                                                        // Persist to disk and activate in the background collector
-                                                                        #[cfg(not(target_arch = "wasm32"))]
-                                                                        {
-                                                                            let _ = crate::local_db::desktop::save_device_token(auth_token);
-                                                                            crate::collector::desktop::set_device_token(auth_token.to_string());
-                                                                        }
-                                                                    }
-                                                                }
-                                                            } else {
-                                                                if let Ok(err_text) = res.text().await {
-                                                                    create_error.set(format!("Server error: {}", err_text));
-                                                                } else {
-                                                                    create_error.set("Server returned an error".to_string());
-                                                                }
-                                                            }
-                                                        },
-                                                        Err(e) => {
-                                                            create_error.set(format!("Network error: {}", e));
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        }
-                                    },
-                                    "Create"
-                                }
-                                button {
-                                    style: "width: 100%; padding: 0.5rem; background-color: transparent; color: #aaa; border: 1px solid transparent; cursor: pointer; font-size: 0.875rem;",
-                                    onclick: move |_| {
-                                        is_adding_device.set(false);
-                                        create_error.set(String::new());
-                                    },
-                                    "Cancel"
-                                }
-                            } else {
-                                div { style: "font-size: 0.75rem; color: #00bfff; font-weight: bold;", "Device Created!" }
-                                div { style: "font-size: 0.75rem; color: #ccc; margin-top: 0.5rem; line-height: 1.4;", "Install & start the background service on your machine:" }
-                                div { 
-                                    style: "font-size: 0.7rem; color: #00ff88; font-family: monospace; word-break: break-all; background-color: #111; padding: 0.6rem; border-radius: 4px; margin-top: 0.5rem; border: 1px solid #333; user-select: all;", 
-                                    "sys_stats service install --token {new_device_token}" 
-                                }
-                                div { style: "font-size: 0.68rem; color: #888; margin-top: 0.4rem; line-height: 1.3;", "Supports macOS (launchd), Linux (systemd / OpenRC), and Windows." }
-                                button {
-                                    style: "width: 100%; padding: 0.5rem; background-color: #333; color: #fff; border: 1px solid #444; border-radius: 4px; cursor: pointer; font-size: 0.875rem; margin-top: 0.5rem;",
-                                    onclick: {
-                                        let t = props.token.clone();
-                                        move |_| {
-                                            is_adding_device.set(false);
-                                            // Refresh device list
-                                            let t = t.clone();
-                                            spawn(async move {
-                                                let client = reqwest::Client::new();
-                                                if let Ok(res) = client.get("https://backend-api.krequiem.workers.dev/api/devices").bearer_auth(&t).send().await {
-                                                    if let Ok(data) = res.json::<Vec<DeviceRecord>>().await {
-                                                        devices.set(data);
-                                                    }
-                                                }
-                                            });
-                                        }
-                                    },
-                                    "Done"
-                                }
-                            }
-                        }
-                    }
-                }
-                div {
-                    style: "padding: 1rem; border-top: 1px solid #111; margin-top: auto;",
-                    button {
-                        style: "width: 100%; padding: 0.5rem; background-color: transparent; color: #ff4444; border: 1px solid #444; border-radius: 4px; cursor: pointer; font-size: 0.875rem;",
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            props.on_logout.call(());
-                        },
-                        "Log Out"
-                    }
-                }
-            }
-
-            // Main Content Area
-            div {
-                style: "flex: 1; display: flex; flex-direction: column; overflow: hidden;",
-
-                // Top Header
-                header {
-                class: "dashboard-header",
-                style: "display: flex; justify-content: space-between; align-items: center; background-color: #252525; padding: 0.5rem 1rem; flex-shrink: 0; border-bottom: 1px solid #111;",
-                div {
-                    class: "header-top",
-                    button {
-                        class: "hamburger-btn",
-                        onclick: move |_| {
-                            let current = *is_sidebar_open.read();
-                            is_sidebar_open.set(!current);
-                        },
-                        "☰"
-                    }
-                    div {
-                        style: "display: flex; align-items: center; gap: 1rem;",
-                        div {
-                            style: "display: flex; flex-direction: column;",
-                            span { style: "font-weight: 600; font-size: 0.9rem; color: #eee;", "Activity Monitor" }
-                            span { style: "font-size: 0.75rem; color: #888;", "All Processes" }
-                        }
-                    }
-                }
-                div {
-                    style: "display: flex; align-items: center; gap: 0.25rem; background-color: #1e1e1e; padding: 0.2rem; border-radius: 6px; border: 1px solid #333;",
-                    button {
-                        class: if current_tab == ActiveTab::Cpu { "tab-button active" } else { "tab-button" },
-                        onclick: move |_| active_tab.set(ActiveTab::Cpu),
-                        "CPU"
-                    }
-                    button {
-                        class: if current_tab == ActiveTab::Memory { "tab-button active" } else { "tab-button" },
-                        onclick: move |_| active_tab.set(ActiveTab::Memory),
-                        "Memory"
-                    }
-                    button {
-                        class: if current_tab == ActiveTab::Disk { "tab-button active" } else { "tab-button" },
-                        onclick: move |_| active_tab.set(ActiveTab::Disk),
-                        "Disk"
-                    }
-                    button {
-                        class: if current_tab == ActiveTab::Network { "tab-button active" } else { "tab-button" },
-                        onclick: move |_| active_tab.set(ActiveTab::Network),
-                        "Network"
-                    }
-                }
-                div {
-                    style: "width: 150px;" // Placeholder for search bar to balance header
-                }
-            }
-
-            // Main Area (Process Table)
-            main {
-                style: "flex: 1; overflow: auto; background-color: #1e1e1e;",
-                table {
-                    class: "process-table",
-                    thead {
-                        tr {
-                            th { "Process Name" }
-                            if current_tab == ActiveTab::Cpu {
-                                th { "% CPU" }
-                                th { "Memory" }
-                            } else if current_tab == ActiveTab::Memory {
-                                th { "Memory" }
-                                th { "% CPU" }
-                            } else if current_tab == ActiveTab::Disk {
-                                th { "Bytes Written" }
-                                th { "Bytes Read" }
-                            } else if current_tab == ActiveTab::Network {
-                                th { "Sent Bytes" }
-                                th { "Rcvd Bytes" }
-                            }
-                            th { class: "hide-on-mobile", "User" }
-                            th { class: "hide-on-mobile", "PID" }
-                        }
-                    }
-                    tbody {
-                        for proc in processes {
-                            tr {
-                                td { style: "color: #ddd;", "{proc.name}" }
-                                if current_tab == ActiveTab::Cpu {
-                                    td { "{proc.cpu_usage:.1}" }
-                                    td { "{proc.memory_bytes / 1024 / 1024} MB" }
-                                } else if current_tab == ActiveTab::Memory {
-                                    td { "{proc.memory_bytes / 1024 / 1024} MB" }
-                                    td { "{proc.cpu_usage:.1}" }
-                                } else if current_tab == ActiveTab::Disk {
-                                    td { "{proc.disk_written_bytes / 1024} KB" }
-                                    td { "{proc.disk_read_bytes / 1024} KB" }
-                                } else if current_tab == ActiveTab::Network {
-                                    td { "0" } // Not supported by sysinfo per-process
-                                    td { "0" }
-                                }
-                                td { class: "hide-on-mobile", "{proc.user_id}" }
-                                td { class: "hide-on-mobile", "{proc.pid}" }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Bottom Dashboard Panel
-            footer {
-                class: "dashboard-footer",
-                style: "height: 180px; background-color: #252525; border-top: 1px solid #111; display: flex; justify-content: center; align-items: center; flex-shrink: 0; padding: 1rem;",
-                div {
-                    class: "dashboard-container",
-                    style: "display: flex; width: 100%; max-width: 900px; height: 100%; border: 1px solid #444; border-radius: 8px; background-color: #1e1e1e;",
-                    
-                    // Left Stats
-                    div {
-                        style: "flex: 1; padding: 1rem; border-right: 1px solid #444; display: flex; flex-direction: column; justify-content: center; gap: 0.5rem; font-size: 0.8125rem;",
-                        if current_tab == ActiveTab::Cpu {
-                            div { style: "display: flex; justify-content: space-between;", span { "System:" }, span { style: "color: rgb(180, 40, 40);", "{latest_cpu * 0.3:.2}%" } }
-                            div { style: "display: flex; justify-content: space-between;", span { "User:" }, span { style: "color: #00bfff;", "{latest_cpu * 0.7:.2}%" } }
-                            div { style: "display: flex; justify-content: space-between;", span { "Idle:" }, span { "{100.0 - latest_cpu:.2}%" } }
-                        } else if current_tab == ActiveTab::Memory {
-                            div { style: "display: flex; justify-content: space-between;", span { "Physical Memory:" }, span { "{latest_mem_total / 1024} GB" } }
-                            div { style: "display: flex; justify-content: space-between;", span { "Memory Used:" }, span { "{latest_mem_used / 1024} GB" } }
-                        } else if current_tab == ActiveTab::Disk {
-                            div { style: "display: flex; justify-content: space-between;", span { "Reads in/sec:" }, span { "{latest.map(|m| m.disk_read_bytes_sec / 1024).unwrap_or(0)} KB" } }
-                            div { style: "display: flex; justify-content: space-between;", span { "Writes out/sec:" }, span { "{latest.map(|m| m.disk_written_bytes_sec / 1024).unwrap_or(0)} KB" } }
-                        } else if current_tab == ActiveTab::Network {
-                            div { style: "display: flex; justify-content: space-between;", span { "Data received/sec:" }, span { style: "color: #00bfff;", "{latest.map(|m| m.network_rx_bytes_sec).unwrap_or(0)} B/s" } }
-                            div { style: "display: flex; justify-content: space-between;", span { "Data sent/sec:" }, span { style: "color: rgb(180, 40, 40);", "{latest.map(|m| m.network_tx_bytes_sec).unwrap_or(0)} B/s" } }
-                        }
-                    }
-
-                    // Middle Graph
-                    div {
-                        style: "flex: 2; padding: 0.5rem; position: relative; overflow: hidden;",
-                        class: "chart-wrapper",
-                        if current_tab == ActiveTab::Cpu {
-                            span { style: "position: absolute; top: 0; width: 100%; text-align: center; font-size: 10px; color: #888; font-weight: 600;", "CPU LOAD" }
-                            LineChart { series: cpu_series.clone(), labels: time_labels.clone(), series_labels: vec!["CPU".into()], height: "100%".to_string(), width: "100%".to_string(), show_dots: false, show_grid: true, lowest: 0.0, highest: 100.0, class_chart_line: "dx-chart-line cpu-chart" }
-                        } else if current_tab == ActiveTab::Memory {
-                            span { style: "position: absolute; top: 0; width: 100%; text-align: center; font-size: 10px; color: #888; font-weight: 600;", "MEMORY PRESSURE" }
-                            LineChart { series: mem_series.clone(), labels: time_labels.clone(), series_labels: vec!["Mem".into()], height: "100%".to_string(), width: "100%".to_string(), show_dots: false, show_grid: true, lowest: 0.0, class_chart_line: "dx-chart-line mem-chart" }
-                        } else if current_tab == ActiveTab::Disk {
-                            span { style: "position: absolute; top: 0; width: 100%; text-align: center; font-size: 10px; color: #888; font-weight: 600;", "IO" }
-                            LineChart { series: vec![disk_series[0].clone(), disk_series[1].clone()], labels: time_labels.clone(), series_labels: vec!["Read".into(), "Write".into()], height: "100%".to_string(), width: "100%".to_string(), show_dots: false, show_grid: true, lowest: 0.0, class_chart_line: "dx-chart-line disk-io-chart" }
-                        } else if current_tab == ActiveTab::Network {
-                            span { style: "position: absolute; top: 0; width: 100%; text-align: center; font-size: 10px; color: #888; font-weight: 600;", "PACKETS" }
-                            LineChart { series: vec![rx_series[0].clone(), tx_series[0].clone()], labels: time_labels.clone(), series_labels: vec!["RX B/s".into(), "TX B/s".into()], height: "100%".to_string(), width: "100%".to_string(), show_dots: false, show_grid: true, lowest: 0.0, class_chart_line: "dx-chart-line network-io-chart" }
-                        }
-                    }
-
-                    // Right Stats
-                    div {
-                        style: "flex: 1; padding: 1rem; border-left: 1px solid #444; display: flex; flex-direction: column; justify-content: center; gap: 0.5rem; font-size: 0.8125rem;",
-                        if current_tab == ActiveTab::Cpu {
-                            div { style: "display: flex; justify-content: space-between;", span { "Threads:" }, span { "{latest_procs * 4}" } } // Fake threads for UI
-                            div { style: "display: flex; justify-content: space-between;", span { "Processes:" }, span { "{latest_procs}" } }
-                        } else if current_tab == ActiveTab::Memory {
-                            div { style: "display: flex; justify-content: space-between;", span { "App Memory:" }, span { "{latest_mem_used / 1024 / 2} GB" } }
-                            div { style: "display: flex; justify-content: space-between;", span { "Wired Memory:" }, span { "{latest_mem_used / 1024 / 4} GB" } }
-                            div { style: "display: flex; justify-content: space-between;", span { "Compressed:" }, span { "{latest_mem_used / 1024 / 8} GB" } }
-                        } else if current_tab == ActiveTab::Disk {
-                            div { style: "display: flex; justify-content: space-between;", span { "Peak read rate:" }, span { "{max_disk_r / 1024.0:.0} KB/s" } }
-                            div { style: "display: flex; justify-content: space-between;", span { "Peak write rate:" }, span { "{max_disk_w / 1024.0:.0} KB/s" } }
-                        } else if current_tab == ActiveTab::Network {
-                            div { style: "display: flex; justify-content: space-between;", span { "Peak rx rate:" }, span { "{max_rx / 1024.0:.0} KB/s" } }
-                            div { style: "display: flex; justify-content: space-between;", span { "Peak tx rate:" }, span { "{max_tx / 1024.0:.0} KB/s" } }
-                        }
-                    }
                     }
                 }
             }

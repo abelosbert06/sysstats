@@ -263,7 +263,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                             if is_breached {
                                 // Check cooldown in SQL
                                 let cooldown_res = d1.prepare("SELECT (last_triggered IS NULL OR (strftime('%s', 'now') - strftime('%s', last_triggered)) >= ?1) as ready FROM alert_rules WHERE id = ?2")
-                                    .bind(&[(rule.cooldown_seconds).into(), rule.id.clone().into()])?
+                                    .bind(&[((rule.cooldown_seconds as f64)).into(), rule.id.clone().into()])?
                                     .first::<i64>(Some("ready")).await;
 
                                 if let Ok(Some(1)) = cooldown_res {
@@ -431,9 +431,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             let d1 = ctx.env.d1("DB")?;
             let rule_id = Uuid::new_v4().to_string();
-            let cooldown = req_data.cooldown_seconds.unwrap_or(900) as i64;
-            let notify_email = if req_data.notify_email.unwrap_or(true) { 1 } else { 0 };
-            let notify_browser = if req_data.notify_browser.unwrap_or(true) { 1 } else { 0 };
+            let cooldown = req_data.cooldown_seconds.unwrap_or(900) as f64;
+            let notify_email: f64 = if req_data.notify_email.unwrap_or(true) { 1.0 } else { 0.0 };
+            let notify_browser: f64 = if req_data.notify_browser.unwrap_or(true) { 1.0 } else { 0.0 };
 
             let email_to_store = user.email.clone().unwrap_or_else(|| format!("{}@placeholder.com", user.id));
             let _ = d1.prepare("INSERT INTO users (id, email) VALUES (?1, ?2) ON CONFLICT(id) DO UPDATE SET email = ?2")

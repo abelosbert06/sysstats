@@ -31,6 +31,15 @@ pub struct DashboardProps {
     pub on_logout: EventHandler<()>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct MetricAlertContext {
+    metric_type: String,
+    display_title: String,
+    current_val_str: String,
+    unit: String,
+    default_threshold: String,
+}
+
 #[component]
 pub fn Dashboard(props: DashboardProps) -> Element {
     let mut metrics_sig = use_signal(|| Vec::<SystemMetricPayload>::new());
@@ -50,18 +59,17 @@ pub fn Dashboard(props: DashboardProps) -> Element {
     // Alerts and Notifications State
     let mut alert_rules = use_signal(|| Vec::<AlertRule>::new());
     let mut alert_history = use_signal(|| Vec::<AlertEvent>::new());
-    let mut is_alert_modal_open = use_signal(|| false);
     let mut is_history_modal_open = use_signal(|| false);
+    let mut is_rules_overview_open = use_signal(|| false);
     let mut active_toast = use_signal(|| Option::<AlertEvent>::None);
 
-    // Form state for creating an alert rule
-    let mut new_rule_metric = use_signal(|| "cpu".to_string());
-    let mut new_rule_threshold = use_signal(|| "85".to_string());
-    let mut new_rule_device_id = use_signal(|| "".to_string());
-    let mut new_rule_cooldown = use_signal(|| "900".to_string());
-    let mut new_rule_email = use_signal(|| true);
-    let mut new_rule_browser = use_signal(|| true);
-    let mut rule_form_error = use_signal(|| String::new());
+    // Direct Click-to-Alert state
+    let mut target_metric_alert = use_signal(|| Option::<MetricAlertContext>::None);
+    let mut target_threshold_input = use_signal(|| String::new());
+    let mut target_scope_device = use_signal(|| true);
+    let mut target_email = use_signal(|| true);
+    let mut target_browser = use_signal(|| true);
+    let mut sheet_error = use_signal(|| String::new());
 
     // Fetch Devices
     let token = props.token.clone();
@@ -106,24 +114,21 @@ pub fn Dashboard(props: DashboardProps) -> Element {
         }
     });
 
-    // Fetch Alert Rules & History Poll Loop (every 5 seconds)
+    // Poll Alert Rules & History
     let token3 = props.token.clone();
     use_future(move || {
         let t = token3.clone();
         async move {
             let client = reqwest::Client::new();
             loop {
-                // Fetch Rules
                 if let Ok(res) = client.get("https://backend-api.krequiem.workers.dev/api/alerts/rules").bearer_auth(&t).send().await {
                     if let Ok(data) = res.json::<Vec<AlertRule>>().await {
                         alert_rules.set(data);
                     }
                 }
 
-                // Fetch Alert History
                 if let Ok(res) = client.get("https://backend-api.krequiem.workers.dev/api/alerts/history").bearer_auth(&t).send().await {
                     if let Ok(events) = res.json::<Vec<AlertEvent>>().await {
-                        // Check if there is an unread alert
                         if let Some(first_unread) = events.iter().find(|e| e.read_at.is_none()) {
                             let current_toast = active_toast.read().clone();
                             if current_toast.as_ref().map(|e| e.id.as_str()) != Some(&first_unread.id) {
@@ -147,6 +152,10 @@ pub fn Dashboard(props: DashboardProps) -> Element {
     let latest_mem_used = latest.map(|m| m.memory_used_mb).unwrap_or(0);
     let latest_mem_total = latest.map(|m| m.memory_total_mb).unwrap_or(0);
     let latest_cpu = latest.map(|m| m.cpu_usage_pct).unwrap_or(0.0);
+    let latest_disk_read = latest.map(|m| m.disk_read_bytes_sec / 1024).unwrap_or(0);
+    let latest_disk_write = latest.map(|m| m.disk_written_bytes_sec / 1024).unwrap_or(0);
+    let latest_net_rx = latest.map(|m| m.network_rx_bytes_sec).unwrap_or(0);
+    let latest_net_tx = latest.map(|m| m.network_tx_bytes_sec).unwrap_or(0);
 
     let empty_vec = Vec::new();
     let processes = latest.map(|m| &m.processes).unwrap_or(&empty_vec);
@@ -186,13 +195,18 @@ pub fn Dashboard(props: DashboardProps) -> Element {
 
     let unread_alerts_count = alert_history.read().iter().filter(|e| e.read_at.is_none()).count();
 
+    let is_metric_monitored = |mtype: &str| -> bool {
+        let dev_id = selected_device_id.read().clone();
+        alert_rules.read().iter().any(|r| r.metric_type == mtype && (r.device_id.as_deref() == Some(&dev_id) || r.device_id.is_none()))
+    };
+
     rsx! {
         div {
-            style: "height: 100vh; width: 100vw; background-color: #1e1e1e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; display: flex; flex-direction: row; overflow: hidden; position: relative;",
+            style: "height: 100vh; width: 100vw; background-color: #1e1e1e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Icons', Roboto, Helvetica, Arial, sans-serif; display: flex; flex-direction: row; overflow: hidden; position: relative;",
             style {
                 "* {{ box-sizing: border-box; }}"
                 "body {{ background-color: #1e1e1e; margin: 0; padding: 0; }}"
-                "svg text {{ fill: #aaaaaa !important; font-size: 10px !important; font-family: monospace !important; }}"
+                "svg text {{ fill: #aaaaaa !important; font-size: 10px !important; font-family: -apple-system, monospace !important; }}"
                 "svg line {{ stroke: #333333 !important; }}"
                 "svg path.domain {{ stroke: #444444 !important; }}"
                 "svg {{ display: block; max-height: 100%; max-width: 100%; }}"
@@ -201,20 +215,23 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                 ".network-io-chart .dx-line-0 path, .disk-io-chart .dx-line-0 path {{ stroke: #00bfff !important; }}"
                 ".network-io-chart .dx-line-1 path, .disk-io-chart .dx-line-1 path {{ stroke: rgb(180, 40, 40) !important; }}"
                 ".process-table {{ width: 100%; border-collapse: collapse; font-size: 0.8125rem; }}"
-                ".process-table th {{ position: sticky; top: 0; background-color: #252525; border-bottom: 1px solid #444; border-right: 1px solid #333; z-index: 10; padding: 0.25rem 0.5rem; color: #ccc; font-weight: 500; text-align: right; }}"
+                ".process-table th {{ position: sticky; top: 0; background-color: #252525; border-bottom: 1px solid #383838; border-right: 1px solid #2e2e2e; z-index: 10; padding: 0.35rem 0.6rem; color: #b0b0b0; font-weight: 500; text-align: right; }}"
                 ".process-table th:first-child, .process-table td:first-child {{ text-align: left; }}"
-                ".process-table td {{ padding: 0.25rem 0.5rem; border-bottom: 1px solid #333; text-align: right; color: #aaa; }}"
-                ".process-table tr:nth-child(even) {{ background-color: #222; }}"
-                ".process-table tr:hover {{ background-color: #333; }}"
-                ".tab-button {{ background: none; border: 1px solid transparent; color: #aaa; padding: 0.25rem 1rem; border-radius: 4px; cursor: pointer; font-size: 0.875rem; font-weight: 500; }}"
-                ".tab-button.active {{ background-color: #333; border-color: #555; color: #fff; box-shadow: 0 1px 2px rgba(0,0,0,0.5); }}"
-                ".sidebar {{ width: 250px; background-color: #252525; border-right: 1px solid #111; display: flex; flex-direction: column; flex-shrink: 0; z-index: 100; transition: transform 0.3s ease; }}"
-                ".device-item {{ padding: 0.75rem; cursor: pointer; border-radius: 6px; color: #ccc; margin-bottom: 0.25rem; display: flex; flex-direction: column; gap: 0.5rem; transition: background-color 0.1s, color 0.1s; }}"
-                ".device-item:hover {{ background-color: #333; color: #fff; }}"
-                ".device-item.selected {{ background-color: #007aff; color: #fff; }}"
+                ".process-table td {{ padding: 0.3rem 0.6rem; border-bottom: 1px solid #282828; text-align: right; color: #a5a5a5; }}"
+                ".process-table tr:nth-child(even) {{ background-color: #212121; }}"
+                ".process-table tr:hover {{ background-color: #2c2c2e; }}"
+                ".tab-button {{ background: none; border: 1px solid transparent; color: #999; padding: 0.25rem 0.9rem; border-radius: 5px; cursor: pointer; font-size: 0.8125rem; font-weight: 500; transition: all 0.15s ease; }}"
+                ".tab-button.active {{ background-color: #38383a; border-color: #48484a; color: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }}"
+                ".sidebar {{ width: 240px; background-color: #252527; border-right: 1px solid #1a1a1a; display: flex; flex-direction: column; flex-shrink: 0; z-index: 100; transition: transform 0.3s ease; }}"
+                ".device-item {{ padding: 0.65rem 0.75rem; cursor: pointer; border-radius: 6px; color: #bbb; margin-bottom: 0.2rem; display: flex; align-items: center; justify-content: space-between; transition: background-color 0.12s, color 0.12s; font-size: 0.875rem; }}"
+                ".device-item:hover {{ background-color: #323234; color: #fff; }}"
+                ".device-item.selected {{ background-color: #007aff; color: #fff; font-weight: 500; }}"
+                ".stat-row {{ display: flex; justify-content: space-between; align-items: center; padding: 0.25rem 0.4rem; border-radius: 4px; cursor: pointer; transition: background-color 0.12s; }}"
+                ".stat-row:hover {{ background-color: #2c2c2e; }}"
+                ".stat-row .alert-dot {{ width: 6px; height: 6px; border-radius: 50%; background-color: #007aff; margin-left: 0.35rem; display: inline-block; }}"
                 ".sidebar-overlay {{ display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.5); z-index: 90; }}"
-                ".hamburger-btn {{ display: none; background: none; border: none; color: #fff; font-size: 1.5rem; cursor: pointer; padding: 0.5rem; margin-right: 0.5rem; }}"
-                ".alert-toast {{ position: fixed; top: 1rem; right: 1rem; z-index: 9999; background: linear-gradient(135deg, #2c1212 0%, #1e1e1e 100%); border: 1px solid #ff4444; border-left: 4px solid #ff4444; color: #fff; padding: 1rem 1.25rem; border-radius: 8px; box-shadow: 0 10px 25px rgba(0,0,0,0.6); display: flex; align-items: center; gap: 1rem; max-width: 450px; animation: slideIn 0.3s ease; }}"
+                ".hamburger-btn {{ display: none; background: none; border: none; color: #fff; font-size: 1.25rem; cursor: pointer; padding: 0.4rem; margin-right: 0.5rem; }}"
+                ".alert-toast {{ position: fixed; top: 1.25rem; right: 1.25rem; z-index: 9999; background: #261818; border: 1px solid #ff453a; border-left: 4px solid #ff453a; color: #fff; padding: 0.85rem 1.15rem; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); display: flex; align-items: center; gap: 0.85rem; max-width: 420px; animation: slideIn 0.25s ease; }}"
                 "@keyframes slideIn {{ from {{ transform: translateX(100%); opacity: 0; }} to {{ transform: translateX(0); opacity: 1; }} }}"
                 "@media (max-width: 768px) {{
                     .sidebar {{ position: fixed; top: 0; left: 0; height: 100vh; transform: translateX(-100%); }}
@@ -223,42 +240,32 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                     .hamburger-btn {{ display: block; }}
                     .dashboard-header {{ flex-direction: column !important; align-items: flex-start !important; gap: 0.75rem; }}
                     .dashboard-header .header-top {{ display: flex; width: 100%; align-items: center; }}
-                    .dashboard-header > div:last-child {{ display: none; }}
-                    .tab-button {{ padding: 0.35rem 0.5rem !important; font-size: 0.75rem !important; }}
+                    .tab-button {{ padding: 0.3rem 0.5rem !important; font-size: 0.75rem !important; }}
                     .hide-on-mobile {{ display: none !important; }}
                     .dashboard-footer {{ height: auto !important; padding: 0.5rem !important; }}
                     .dashboard-container {{ flex-direction: column !important; }}
-                    .dashboard-container > div {{ border-right: none !important; border-left: none !important; border-bottom: 1px solid #444; padding: 0.75rem !important; }}
+                    .dashboard-container > div {{ border-right: none !important; border-left: none !important; border-bottom: 1px solid #333; padding: 0.75rem !important; }}
                     .dashboard-container > div:last-child {{ border-bottom: none; }}
                     .chart-wrapper {{ min-height: 140px; }}
                 }}"
-            }
-
-            script {
-                "
-                const observer = new MutationObserver((mutations) => {{
-                    document.querySelectorAll('svg.dx-chart-line').forEach(svg => {{
-                        if (svg.getAttribute('preserveAspectRatio') !== 'none') {{
-                            svg.setAttribute('preserveAspectRatio', 'none');
-                        }}
-                    }});
-                }});
-                observer.observe(document.body, {{ childList: true, subtree: true }});
-                "
             }
 
             // In-App Alert Toast Notification
             if let Some(toast) = active_toast.read().clone() {
                 div {
                     class: "alert-toast",
-                    div { style: "font-size: 1.5rem;", "⚠️" }
+                    svg {
+                        style: "width: 20px; height: 20px; flex-shrink: 0; fill: #ff453a;",
+                        view_box: "0 0 24 24",
+                        path { d: "M12 2L1 21h22L12 2zm0 3.5L20.3 19H3.7L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z" }
+                    }
                     div {
                         style: "flex: 1;",
-                        div { style: "font-size: 0.75rem; font-weight: 700; color: #ff6666; text-transform: uppercase;", "Threshold Alert Triggered" }
-                        div { style: "font-size: 0.85rem; margin-top: 0.2rem; color: #eee;", "{toast.message}" }
+                        div { style: "font-size: 0.75rem; font-weight: 600; color: #ff6961; text-transform: uppercase; letter-spacing: 0.5px;", "Threshold Alert" }
+                        div { style: "font-size: 0.8125rem; margin-top: 0.15rem; color: #f0f0f0;", "{toast.message}" }
                     }
                     button {
-                        style: "background: #333; border: 1px solid #555; color: #fff; border-radius: 4px; padding: 0.3rem 0.6rem; font-size: 0.75rem; cursor: pointer;",
+                        style: "background: #333; border: 1px solid #444; color: #eee; border-radius: 4px; padding: 0.25rem 0.5rem; font-size: 0.75rem; cursor: pointer;",
                         onclick: {
                             let t = props.token.clone();
                             let aid = toast.id.clone();
@@ -287,20 +294,25 @@ pub fn Dashboard(props: DashboardProps) -> Element {
             div {
                 class: if *is_sidebar_open.read() { "sidebar open" } else { "sidebar" },
                 div {
-                    style: "padding: 1rem; border-bottom: 1px solid #111; display: flex; justify-content: space-between; align-items: center;",
+                    style: "padding: 0.85rem 1rem; border-bottom: 1px solid #1f1f21; display: flex; justify-content: space-between; align-items: center;",
                     div {
-                        style: "font-weight: 600; font-size: 1rem; color: #fff;",
+                        style: "font-weight: 600; font-size: 0.875rem; color: #f5f5f7; letter-spacing: -0.2px;",
                         "Activity Monitor"
                     }
                     button {
-                        style: "background: none; border: none; color: #888; cursor: pointer; font-size: 1.2rem; padding: 0.25rem;",
+                        style: "background: none; border: none; color: #8e8e93; cursor: pointer; padding: 0.2rem; display: flex; align-items: center;",
+                        title: "Log Out",
                         onclick: move |_| props.on_logout.call(()),
-                        "🚪"
+                        svg {
+                            style: "width: 16px; height: 16px; fill: currentColor;",
+                            view_box: "0 0 24 24",
+                            path { d: "M16 13v-2H7V8l-5 4 5 4v-3h9zM20 3h-9c-1.1 0-2 .9-2 2v4h2V5h9v14h-9v-4H9v4c0 1.1.9 2 2 2h9c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z" }
+                        }
                     }
                 }
 
                 div {
-                    style: "flex: 1; overflow-y: auto; padding: 0.5rem;",
+                    style: "flex: 1; overflow-y: auto; padding: 0.4rem;",
                     for dev in devices.read().iter() {
                         div {
                             key: "{dev.id}",
@@ -313,56 +325,63 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                                     is_sidebar_open.set(false);
                                 }
                             },
+                            span { style: "overflow: hidden; text-overflow: ellipsis; white-space: nowrap;", "{dev.name}" }
                             div {
-                                style: "display: flex; justify-content: space-between; align-items: center;",
-                                span { style: "font-weight: 500; font-size: 0.9rem;", "{dev.name}" }
-                                div {
-                                    style: "display: flex; gap: 0.4rem;",
-                                    button {
-                                        style: "background: none; border: none; color: #aaa; cursor: pointer; font-size: 0.8rem; padding: 0.2rem;",
-                                        onclick: {
-                                            let id = dev.id.clone();
-                                            let name = dev.name.clone();
-                                            move |evt| {
-                                                evt.stop_propagation();
-                                                editing_device_id.set(id.clone());
-                                                edit_device_name.set(name.clone());
-                                            }
-                                        },
-                                        "✏️"
+                                style: "display: flex; gap: 0.2rem; align-items: center;",
+                                button {
+                                    style: "background: none; border: none; color: inherit; opacity: 0.7; cursor: pointer; padding: 0.2rem; display: flex; align-items: center;",
+                                    title: "Rename",
+                                    onclick: {
+                                        let id = dev.id.clone();
+                                        let name = dev.name.clone();
+                                        move |evt| {
+                                            evt.stop_propagation();
+                                            editing_device_id.set(id.clone());
+                                            edit_device_name.set(name.clone());
+                                        }
+                                    },
+                                    svg {
+                                        style: "width: 13px; height: 13px; fill: currentColor;",
+                                        view_box: "0 0 24 24",
+                                        path { d: "M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" }
                                     }
-                                    button {
-                                        style: "background: none; border: none; color: #aaa; cursor: pointer; font-size: 0.8rem; padding: 0.2rem;",
-                                        onclick: {
-                                            let id = dev.id.clone();
-                                            let t = props.token.clone();
-                                            move |evt| {
-                                                evt.stop_propagation();
-                                                let id = id.clone();
-                                                let t = t.clone();
-                                                spawn(async move {
-                                                    let client = reqwest::Client::new();
-                                                    let url = format!("https://backend-api.krequiem.workers.dev/api/devices/{}", id);
-                                                    if let Ok(res) = client.delete(&url).bearer_auth(&t).send().await {
-                                                        if res.status().is_success() {
-                                                            if let Ok(res2) = client.get("https://backend-api.krequiem.workers.dev/api/devices").bearer_auth(&t).send().await {
-                                                                if let Ok(data) = res2.json::<Vec<DeviceRecord>>().await {
-                                                                    if *selected_device_id.read() == id {
-                                                                        if !data.is_empty() {
-                                                                            selected_device_id.set(data[0].id.clone());
-                                                                        } else {
-                                                                            selected_device_id.set(String::new());
-                                                                        }
+                                }
+                                button {
+                                    style: "background: none; border: none; color: inherit; opacity: 0.7; cursor: pointer; padding: 0.2rem; display: flex; align-items: center;",
+                                    title: "Delete",
+                                    onclick: {
+                                        let id = dev.id.clone();
+                                        let t = props.token.clone();
+                                        move |evt| {
+                                            evt.stop_propagation();
+                                            let id = id.clone();
+                                            let t = t.clone();
+                                            spawn(async move {
+                                                let client = reqwest::Client::new();
+                                                let url = format!("https://backend-api.krequiem.workers.dev/api/devices/{}", id);
+                                                if let Ok(res) = client.delete(&url).bearer_auth(&t).send().await {
+                                                    if res.status().is_success() {
+                                                        if let Ok(res2) = client.get("https://backend-api.krequiem.workers.dev/api/devices").bearer_auth(&t).send().await {
+                                                            if let Ok(data) = res2.json::<Vec<DeviceRecord>>().await {
+                                                                if *selected_device_id.read() == id {
+                                                                    if !data.is_empty() {
+                                                                        selected_device_id.set(data[0].id.clone());
+                                                                    } else {
+                                                                        selected_device_id.set(String::new());
                                                                     }
-                                                                    devices.set(data);
                                                                 }
+                                                                devices.set(data);
                                                             }
                                                         }
                                                     }
-                                                });
-                                            }
-                                        },
-                                        "🗑️"
+                                                }
+                                            });
+                                        }
+                                    },
+                                    svg {
+                                        style: "width: 13px; height: 13px; fill: currentColor;",
+                                        view_box: "0 0 24 24",
+                                        path { d: "M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" }
                                     }
                                 }
                             }
@@ -370,11 +389,11 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                     }
                 }
 
-                // Sidebar Footer Action Buttons
+                // Sidebar Footer
                 div {
-                    style: "padding: 0.75rem; border-top: 1px solid #111; display: flex; flex-direction: column; gap: 0.5rem;",
+                    style: "padding: 0.75rem; border-top: 1px solid #1f1f21; display: flex; flex-direction: column; gap: 0.4rem;",
                     button {
-                        style: "width: 100%; padding: 0.6rem; background-color: #007aff; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 0.875rem; font-weight: 500;",
+                        style: "width: 100%; padding: 0.45rem; background-color: #007aff; color: #fff; border: none; border-radius: 5px; cursor: pointer; font-size: 0.8125rem; font-weight: 500;",
                         onclick: move |_| {
                             new_device_name.set(String::new());
                             new_device_token.set(String::new());
@@ -384,21 +403,21 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                         "+ Add Device"
                     }
                     button {
-                        style: "width: 100%; padding: 0.5rem; background-color: #2a2a2a; color: #ccc; border: 1px solid #444; border-radius: 6px; cursor: pointer; font-size: 0.8125rem;",
-                        onclick: move |_| is_alert_modal_open.set(true),
-                        "⚙️ Alert Rules"
+                        style: "width: 100%; padding: 0.4rem; background-color: #2c2c2e; color: #aaa; border: 1px solid #3a3a3c; border-radius: 5px; cursor: pointer; font-size: 0.75rem;",
+                        onclick: move |_| is_rules_overview_open.set(true),
+                        "Manage All Rules"
                     }
                 }
             }
 
-            // Central Content Area
+            // Main Central Panel
             div {
                 style: "flex: 1; display: flex; flex-direction: column; overflow: hidden; background-color: #1e1e1e;",
 
-                // Top Header
+                // Header
                 header {
                     class: "dashboard-header",
-                    style: "height: 60px; background-color: #252525; border-bottom: 1px solid #111; display: flex; align-items: center; justify-content: space-between; padding: 0 1rem; flex-shrink: 0;",
+                    style: "height: 52px; background-color: #252527; border-bottom: 1px solid #1a1a1a; display: flex; align-items: center; justify-content: space-between; padding: 0 1rem; flex-shrink: 0;",
                     div {
                         class: "header-top",
                         style: "display: flex; align-items: center;",
@@ -411,14 +430,14 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                             "☰"
                         }
                         div {
-                            h2 { style: "margin: 0; font-size: 1.125rem; font-weight: 600; color: #fff;", "{selected_device_name}" }
-                            span { style: "font-size: 0.75rem; color: #888;", "Real-Time Telemetry Monitor" }
+                            h2 { style: "margin: 0; font-size: 1rem; font-weight: 600; color: #f5f5f7;", "{selected_device_name}" }
+                            span { style: "font-size: 0.7rem; color: #8e8e93;", "Telemetry Monitor" }
                         }
                     }
 
-                    // Center Tabs
+                    // Segmented Tabs
                     div {
-                        style: "display: flex; align-items: center; gap: 0.25rem; background-color: #1e1e1e; padding: 0.2rem; border-radius: 6px; border: 1px solid #333;",
+                        style: "display: flex; align-items: center; gap: 0.15rem; background-color: #1c1c1e; padding: 0.15rem; border-radius: 6px; border: 1px solid #2c2c2e;",
                         button {
                             class: if current_tab == ActiveTab::Cpu { "tab-button active" } else { "tab-button" },
                             onclick: move |_| active_tab.set(ActiveTab::Cpu),
@@ -441,17 +460,21 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                         }
                     }
 
-                    // Header Right Actions
+                    // Header Right Notifications Bell
                     div {
-                        style: "display: flex; align-items: center; gap: 0.75rem;",
+                        style: "display: flex; align-items: center; gap: 0.5rem;",
                         button {
-                            style: "background: #1e1e1e; border: 1px solid #444; color: #fff; border-radius: 6px; padding: 0.35rem 0.75rem; font-size: 0.8125rem; cursor: pointer; display: flex; align-items: center; gap: 0.4rem;",
+                            style: "background: #1c1c1e; border: 1px solid #333; color: #e0e0e0; border-radius: 5px; padding: 0.35rem 0.6rem; font-size: 0.75rem; cursor: pointer; display: flex; align-items: center; gap: 0.4rem;",
+                            title: "Alerts Center",
                             onclick: move |_| is_history_modal_open.set(true),
-                            "🔔"
-                            span { "Alerts" }
+                            svg {
+                                style: "width: 14px; height: 14px; fill: currentColor;",
+                                view_box: "0 0 24 24",
+                                path { d: "M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z" }
+                            }
                             if unread_alerts_count > 0 {
                                 span {
-                                    style: "background: #ff4444; color: #fff; font-size: 0.7rem; font-weight: 700; padding: 0.1rem 0.4rem; border-radius: 10px;",
+                                    style: "background: #ff453a; color: #fff; font-size: 0.65rem; font-weight: 700; padding: 0.05rem 0.35rem; border-radius: 8px;",
                                     "{unread_alerts_count}"
                                 }
                             }
@@ -459,7 +482,7 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                     }
                 }
 
-                // Main Area (Process Table)
+                // Process Table
                 main {
                     style: "flex: 1; overflow: auto; background-color: #1e1e1e;",
                     table {
@@ -509,32 +532,142 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                     }
                 }
 
-                // Bottom Dashboard Panel
+                // Interactive Bottom Stats Panel
                 footer {
                     class: "dashboard-footer",
-                    style: "height: 180px; background-color: #252525; border-top: 1px solid #111; display: flex; justify-content: center; align-items: center; flex-shrink: 0; padding: 1rem;",
+                    style: "height: 180px; background-color: #252527; border-top: 1px solid #1a1a1a; display: flex; justify-content: center; align-items: center; flex-shrink: 0; padding: 0.75rem;",
                     div {
                         class: "dashboard-container",
-                        style: "display: flex; width: 100%; max-width: 900px; height: 100%; border: 1px solid #444; border-radius: 8px; background-color: #1e1e1e;",
+                        style: "display: flex; width: 100%; max-width: 900px; height: 100%; border: 1px solid #333; border-radius: 8px; background-color: #1e1e1e;",
                         
+                        // Left Interactive Stats Column
                         div {
-                            style: "flex: 1; padding: 1rem; border-right: 1px solid #444; display: flex; flex-direction: column; justify-content: center; gap: 0.5rem; font-size: 0.8125rem;",
+                            style: "flex: 1; padding: 0.75rem; border-right: 1px solid #333; display: flex; flex-direction: column; justify-content: center; gap: 0.35rem; font-size: 0.8125rem;",
                             if current_tab == ActiveTab::Cpu {
-                                div { style: "display: flex; justify-content: space-between;", span { "System:" }, span { style: "color: rgb(180, 40, 40);", "{latest_cpu * 0.3:.2}%" } }
-                                div { style: "display: flex; justify-content: space-between;", span { "User:" }, span { style: "color: #00bfff;", "{latest_cpu * 0.7:.2}%" } }
-                                div { style: "display: flex; justify-content: space-between;", span { "Idle:" }, span { "{100.0 - latest_cpu:.2}%" } }
+                                div {
+                                    class: "stat-row",
+                                    title: "Click to set alert threshold",
+                                    onclick: move |_| {
+                                        target_metric_alert.set(Some(MetricAlertContext {
+                                            metric_type: "cpu".to_string(),
+                                            display_title: "System CPU Usage".to_string(),
+                                            current_val_str: format!("{:.2}%", latest_cpu * 0.3),
+                                            unit: "%".to_string(),
+                                            default_threshold: "80".to_string(),
+                                        }));
+                                        target_threshold_input.set("80".to_string());
+                                        sheet_error.set(String::new());
+                                    },
+                                    span { "System:" if is_metric_monitored("cpu") { span { class: "alert-dot" } } },
+                                    span { style: "color: rgb(180, 40, 40);", "{latest_cpu * 0.3:.2}%" }
+                                }
+                                div {
+                                    class: "stat-row",
+                                    title: "Click to set alert threshold",
+                                    onclick: move |_| {
+                                        target_metric_alert.set(Some(MetricAlertContext {
+                                            metric_type: "cpu".to_string(),
+                                            display_title: "User CPU Usage".to_string(),
+                                            current_val_str: format!("{:.2}%", latest_cpu * 0.7),
+                                            unit: "%".to_string(),
+                                            default_threshold: "85".to_string(),
+                                        }));
+                                        target_threshold_input.set("85".to_string());
+                                        sheet_error.set(String::new());
+                                    },
+                                    span { "User:" },
+                                    span { style: "color: #00bfff;", "{latest_cpu * 0.7:.2}%" }
+                                }
+                                div {
+                                    class: "stat-row",
+                                    title: "Click to set alert threshold",
+                                    onclick: move |_| {
+                                        target_metric_alert.set(Some(MetricAlertContext {
+                                            metric_type: "cpu".to_string(),
+                                            display_title: "Total CPU Load".to_string(),
+                                            current_val_str: format!("{:.2}%", latest_cpu),
+                                            unit: "%".to_string(),
+                                            default_threshold: "90".to_string(),
+                                        }));
+                                        target_threshold_input.set("90".to_string());
+                                        sheet_error.set(String::new());
+                                    },
+                                    span { "Idle:" },
+                                    span { "{100.0 - latest_cpu:.2}%" }
+                                }
                             } else if current_tab == ActiveTab::Memory {
-                                div { style: "display: flex; justify-content: space-between;", span { "Physical Memory:" }, span { "{latest_mem_total / 1024} GB" } }
-                                div { style: "display: flex; justify-content: space-between;", span { "Memory Used:" }, span { "{latest_mem_used / 1024} GB" } }
+                                div {
+                                    class: "stat-row",
+                                    span { "Physical Memory:" },
+                                    span { "{latest_mem_total / 1024} GB" }
+                                }
+                                div {
+                                    class: "stat-row",
+                                    title: "Click to set alert threshold",
+                                    onclick: move |_| {
+                                        target_metric_alert.set(Some(MetricAlertContext {
+                                            metric_type: "memory".to_string(),
+                                            display_title: "Memory Pressure".to_string(),
+                                            current_val_str: format!("{} GB", latest_mem_used / 1024),
+                                            unit: "%".to_string(),
+                                            default_threshold: "90".to_string(),
+                                        }));
+                                        target_threshold_input.set("90".to_string());
+                                        sheet_error.set(String::new());
+                                    },
+                                    span { "Memory Used:" if is_metric_monitored("memory") { span { class: "alert-dot" } } },
+                                    span { "{latest_mem_used / 1024} GB" }
+                                }
                             } else if current_tab == ActiveTab::Disk {
-                                div { style: "display: flex; justify-content: space-between;", span { "Reads in/sec:" }, span { "{latest.map(|m| m.disk_read_bytes_sec / 1024).unwrap_or(0)} KB" } }
-                                div { style: "display: flex; justify-content: space-between;", span { "Writes out/sec:" }, span { "{latest.map(|m| m.disk_written_bytes_sec / 1024).unwrap_or(0)} KB" } }
+                                div {
+                                    class: "stat-row",
+                                    title: "Click to set alert threshold",
+                                    onclick: move |_| {
+                                        target_metric_alert.set(Some(MetricAlertContext {
+                                            metric_type: "disk".to_string(),
+                                            display_title: "Disk Read Rate".to_string(),
+                                            current_val_str: format!("{} KB/s", latest_disk_read),
+                                            unit: "KB/s".to_string(),
+                                            default_threshold: "50000".to_string(),
+                                        }));
+                                        target_threshold_input.set("50000".to_string());
+                                        sheet_error.set(String::new());
+                                    },
+                                    span { "Reads in/sec:" if is_metric_monitored("disk") { span { class: "alert-dot" } } },
+                                    span { "{latest_disk_read} KB" }
+                                }
+                                div {
+                                    class: "stat-row",
+                                    title: "Click to set alert threshold",
+                                    onclick: move |_| {
+                                        target_metric_alert.set(Some(MetricAlertContext {
+                                            metric_type: "disk".to_string(),
+                                            display_title: "Disk Write Rate".to_string(),
+                                            current_val_str: format!("{} KB/s", latest_disk_write),
+                                            unit: "KB/s".to_string(),
+                                            default_threshold: "50000".to_string(),
+                                        }));
+                                        target_threshold_input.set("50000".to_string());
+                                        sheet_error.set(String::new());
+                                    },
+                                    span { "Writes out/sec:" },
+                                    span { "{latest_disk_write} KB" }
+                                }
                             } else if current_tab == ActiveTab::Network {
-                                div { style: "display: flex; justify-content: space-between;", span { "Data received/sec:" }, span { style: "color: #00bfff;", "{latest.map(|m| m.network_rx_bytes_sec).unwrap_or(0)} B/s" } }
-                                div { style: "display: flex; justify-content: space-between;", span { "Data sent/sec:" }, span { style: "color: rgb(180, 40, 40);", "{latest.map(|m| m.network_tx_bytes_sec).unwrap_or(0)} B/s" } }
+                                div {
+                                    class: "stat-row",
+                                    span { "Data received/sec:" },
+                                    span { style: "color: #00bfff;", "{latest_net_rx} B/s" }
+                                }
+                                div {
+                                    class: "stat-row",
+                                    span { "Data sent/sec:" },
+                                    span { style: "color: rgb(180, 40, 40);", "{latest_net_tx} B/s" }
+                                }
                             }
                         }
 
+                        // Middle Chart
                         div {
                             style: "flex: 2; padding: 0.5rem; position: relative; overflow: hidden;",
                             class: "chart-wrapper",
@@ -553,11 +686,28 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                             }
                         }
 
+                        // Right Interactive Stats Column
                         div {
-                            style: "flex: 1; padding: 1rem; border-left: 1px solid #444; display: flex; flex-direction: column; justify-content: center; gap: 0.5rem; font-size: 0.8125rem;",
+                            style: "flex: 1; padding: 0.75rem; border-left: 1px solid #333; display: flex; flex-direction: column; justify-content: center; gap: 0.35rem; font-size: 0.8125rem;",
                             if current_tab == ActiveTab::Cpu {
                                 div { style: "display: flex; justify-content: space-between;", span { "Threads:" }, span { "{latest_procs * 4}" } }
-                                div { style: "display: flex; justify-content: space-between;", span { "Processes:" }, span { "{latest_procs}" } }
+                                div {
+                                    class: "stat-row",
+                                    title: "Click to set alert threshold",
+                                    onclick: move |_| {
+                                        target_metric_alert.set(Some(MetricAlertContext {
+                                            metric_type: "cpu".to_string(),
+                                            display_title: "Active Processes".to_string(),
+                                            current_val_str: format!("{}", latest_procs),
+                                            unit: "Count".to_string(),
+                                            default_threshold: "1000".to_string(),
+                                        }));
+                                        target_threshold_input.set("1000".to_string());
+                                        sheet_error.set(String::new());
+                                    },
+                                    span { "Processes:" },
+                                    span { "{latest_procs}" }
+                                }
                             } else if current_tab == ActiveTab::Memory {
                                 div { style: "display: flex; justify-content: space-between;", span { "App Memory:" }, span { "{latest_mem_used / 1024 / 2} GB" } }
                                 div { style: "display: flex; justify-content: space-between;", span { "Wired Memory:" }, span { "{latest_mem_used / 1024 / 4} GB" } }
@@ -574,79 +724,244 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                 }
             }
 
+            // Modal: Direct Metric Alert Sheet (macOS Popover Sheet)
+            if let Some(target) = target_metric_alert.read().clone() {
+                div {
+                    style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-color: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 1000; animation: fadeIn 0.15s ease;",
+                    div {
+                        style: "background-color: #28282a; padding: 1.75rem; border-radius: 10px; border: 1px solid #3a3a3c; width: 100%; max-width: 420px; box-shadow: 0 16px 36px rgba(0,0,0,0.6); display: flex; flex-direction: column; gap: 1.25rem;",
+                        div {
+                            style: "display: flex; justify-content: space-between; align-items: flex-start;",
+                            div {
+                                h3 { style: "margin: 0; color: #fff; font-size: 1.05rem; font-weight: 600;", "Set Alert: {target.display_title}" }
+                                div { style: "font-size: 0.75rem; color: #8e8e93; margin-top: 0.2rem;", "Current value: {target.current_val_str}" }
+                            }
+                            button {
+                                style: "background: none; border: none; color: #8e8e93; cursor: pointer; padding: 0.2rem;",
+                                onclick: move |_| target_metric_alert.set(None),
+                                svg {
+                                    style: "width: 14px; height: 14px; fill: currentColor;",
+                                    view_box: "0 0 24 24",
+                                    path { d: "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" }
+                                }
+                            }
+                        }
+
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 0.85rem;",
+                            div {
+                                label { style: "font-size: 0.75rem; color: #bbb; font-weight: 500;", "Trigger notification when value exceeds ({target.unit}):" }
+                                input {
+                                    type: "number",
+                                    style: "width: 100%; background: #1c1c1e; border: 1px solid #3a3a3c; color: #fff; padding: 0.5rem; border-radius: 5px; font-size: 0.9rem; margin-top: 0.3rem;",
+                                    value: "{target_threshold_input}",
+                                    oninput: move |evt| target_threshold_input.set(evt.value()),
+                                }
+                            }
+
+                            div {
+                                label { style: "font-size: 0.75rem; color: #bbb; font-weight: 500;", "Scope:" }
+                                div {
+                                    style: "display: flex; gap: 0.5rem; margin-top: 0.3rem;",
+                                    button {
+                                        style: format!(
+                                            "flex: 1; padding: 0.4rem; border-radius: 5px; font-size: 0.75rem; cursor: pointer; border: 1px solid {}; background: {}; color: {};",
+                                            if *target_scope_device.read() { "#007aff" } else { "#3a3a3c" },
+                                            if *target_scope_device.read() { "#007aff" } else { "#1c1c1e" },
+                                            if *target_scope_device.read() { "#fff" } else { "#aaa" }
+                                        ),
+                                        onclick: move |_| target_scope_device.set(true),
+                                        "This Device Only"
+                                    }
+                                    button {
+                                        style: format!(
+                                            "flex: 1; padding: 0.4rem; border-radius: 5px; font-size: 0.75rem; cursor: pointer; border: 1px solid {}; background: {}; color: {};",
+                                            if !*target_scope_device.read() { "#007aff" } else { "#3a3a3c" },
+                                            if !*target_scope_device.read() { "#007aff" } else { "#1c1c1e" },
+                                            if !*target_scope_device.read() { "#fff" } else { "#aaa" }
+                                        ),
+                                        onclick: move |_| target_scope_device.set(false),
+                                        "All Devices"
+                                    }
+                                }
+                            }
+
+                            div {
+                                style: "display: flex; gap: 1rem; align-items: center; margin-top: 0.25rem;",
+                                label {
+                                    style: "font-size: 0.75rem; color: #bbb; display: flex; align-items: center; gap: 0.35rem; cursor: pointer;",
+                                    input {
+                                        type: "checkbox",
+                                        checked: *target_email.read(),
+                                        onchange: move |_| {
+                                            let cur = *target_email.read();
+                                            target_email.set(!cur);
+                                        }
+                                    }
+                                    "Email Alert"
+                                }
+                                label {
+                                    style: "font-size: 0.75rem; color: #bbb; display: flex; align-items: center; gap: 0.35rem; cursor: pointer;",
+                                    input {
+                                        type: "checkbox",
+                                        checked: *target_browser.read(),
+                                        onchange: move |_| {
+                                            let cur = *target_browser.read();
+                                            target_browser.set(!cur);
+                                        }
+                                    }
+                                    "In-App Toast Alert"
+                                }
+                            }
+
+                            if !sheet_error.read().is_empty() {
+                                div { style: "color: #ff453a; font-size: 0.75rem;", "{sheet_error}" }
+                            }
+                        }
+
+                        div {
+                            style: "display: flex; justify-content: flex-end; gap: 0.5rem; border-top: 1px solid #333; padding-top: 1rem;",
+                            button {
+                                style: "padding: 0.45rem 0.9rem; background: #3a3a3c; color: #eee; border: none; border-radius: 5px; cursor: pointer; font-size: 0.8125rem;",
+                                onclick: move |_| target_metric_alert.set(None),
+                                "Cancel"
+                            }
+                            button {
+                                style: "padding: 0.45rem 1rem; background: #007aff; color: #fff; border: none; border-radius: 5px; cursor: pointer; font-size: 0.8125rem; font-weight: 500;",
+                                onclick: {
+                                    let t = props.token.clone();
+                                    move |_| {
+                                        let thresh: f32 = match target_threshold_input.read().parse() {
+                                            Ok(v) => v,
+                                            Err(_) => {
+                                                sheet_error.set("Please enter a valid number".to_string());
+                                                return;
+                                            }
+                                        };
+                                        let mtype = target.metric_type.clone();
+                                        let dev_opt = if *target_scope_device.read() {
+                                            let cur_dev = selected_device_id.read().clone();
+                                            if cur_dev.is_empty() { None } else { Some(cur_dev) }
+                                        } else {
+                                            None
+                                        };
+
+                                        let req = CreateAlertRuleRequest {
+                                            device_id: dev_opt,
+                                            metric_type: mtype,
+                                            threshold_value: thresh,
+                                            cooldown_seconds: Some(900),
+                                            notify_email: Some(*target_email.read()),
+                                            notify_browser: Some(*target_browser.read()),
+                                        };
+
+                                        let t = t.clone();
+                                        spawn(async move {
+                                            let client = reqwest::Client::new();
+                                            let res = client.post("https://backend-api.krequiem.workers.dev/api/alerts/rules")
+                                                .bearer_auth(&t)
+                                                .json(&req)
+                                                .send()
+                                                .await;
+
+                                            if let Ok(resp) = res {
+                                                if resp.status().is_success() {
+                                                    target_metric_alert.set(None);
+                                                    if let Ok(res2) = client.get("https://backend-api.krequiem.workers.dev/api/alerts/rules").bearer_auth(&t).send().await {
+                                                        if let Ok(data) = res2.json::<Vec<AlertRule>>().await {
+                                                            alert_rules.set(data);
+                                                        }
+                                                    }
+                                                } else {
+                                                    sheet_error.set("Failed to set alert rule".to_string());
+                                                }
+                                            }
+                                        });
+                                    }
+                                },
+                                "Set Alert"
+                            }
+                        }
+                    }
+                }
+            }
+
             // Modal: Add Device
             if *is_adding_device.read() {
                 div {
                     style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-color: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 1000;",
                     div {
-                        style: "background-color: #252525; padding: 2rem; border-radius: 8px; border: 1px solid #444; width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: 1rem;",
-                        h3 { style: "margin: 0; color: #fff;", "Add New Device" }
+                        style: "background-color: #28282a; padding: 1.75rem; border-radius: 10px; border: 1px solid #3a3a3c; width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: 1rem;",
+                        h3 { style: "margin: 0; color: #fff; font-size: 1.05rem;", "Add New Device" }
                         if new_device_token.read().is_empty() {
                             input {
                                 type: "text",
-                                placeholder: "Device Name (e.g. My Laptop)",
+                                placeholder: "Device Name (e.g. Work MacBook)",
                                 value: "{new_device_name}",
                                 oninput: move |evt| new_device_name.set(evt.value()),
-                                style: "background-color: #1e1e1e; border: 1px solid #444; color: #fff; padding: 0.5rem; border-radius: 4px;",
+                                style: "background-color: #1c1c1e; border: 1px solid #3a3a3c; color: #fff; padding: 0.5rem; border-radius: 5px; font-size: 0.875rem;",
                             }
                             if !create_error.read().is_empty() {
-                                div { style: "color: #ff4444; font-size: 0.75rem;", "{create_error}" }
+                                div { style: "color: #ff453a; font-size: 0.75rem;", "{create_error}" }
                             }
-                            button {
-                                style: "width: 100%; padding: 0.5rem; background-color: #007aff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.875rem;",
-                                onclick: {
-                                    let t = props.token.clone();
-                                    move |_| {
-                                        let name = new_device_name.read().clone();
-                                        if name.is_empty() {
-                                            create_error.set("Name cannot be empty".to_string());
-                                            return;
-                                        }
-                                        let t = t.clone();
-                                        spawn(async move {
-                                            let client = reqwest::Client::new();
-                                            let res = client.post("https://backend-api.krequiem.workers.dev/api/devices")
-                                                .bearer_auth(&t)
-                                                .json(&serde_json::json!({ "name": name }))
-                                                .send()
-                                                .await;
-                                            match res {
-                                                Ok(resp) => {
-                                                    if resp.status().is_success() {
-                                                        if let Ok(data) = resp.json::<serde_json::Value>().await {
-                                                            if let Some(tok) = data.get("auth_token").and_then(|v| v.as_str()) {
-                                                                new_device_token.set(tok.to_string());
-                                                            }
-                                                        }
-                                                    } else {
-                                                        create_error.set("Failed to create device".to_string());
-                                                    }
-                                                }
-                                                Err(e) => create_error.set(e.to_string()),
+                            div {
+                                style: "display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.5rem;",
+                                button {
+                                    style: "padding: 0.45rem 0.9rem; background-color: transparent; color: #aaa; border: 1px solid transparent; cursor: pointer; font-size: 0.8125rem;",
+                                    onclick: move |_| {
+                                        is_adding_device.set(false);
+                                        create_error.set(String::new());
+                                    },
+                                    "Cancel"
+                                }
+                                button {
+                                    style: "padding: 0.45rem 1rem; background-color: #007aff; color: #fff; border: none; border-radius: 5px; cursor: pointer; font-size: 0.8125rem; font-weight: 500;",
+                                    onclick: {
+                                        let t = props.token.clone();
+                                        move |_| {
+                                            let name = new_device_name.read().clone();
+                                            if name.is_empty() {
+                                                create_error.set("Name cannot be empty".to_string());
+                                                return;
                                             }
-                                        });
-                                    }
-                                },
-                                "Create"
-                            }
-                            button {
-                                style: "width: 100%; padding: 0.5rem; background-color: transparent; color: #aaa; border: 1px solid transparent; cursor: pointer; font-size: 0.875rem;",
-                                onclick: move |_| {
-                                    is_adding_device.set(false);
-                                    create_error.set(String::new());
-                                },
-                                "Cancel"
+                                            let t = t.clone();
+                                            spawn(async move {
+                                                let client = reqwest::Client::new();
+                                                let res = client.post("https://backend-api.krequiem.workers.dev/api/devices")
+                                                    .bearer_auth(&t)
+                                                    .json(&serde_json::json!({ "name": name }))
+                                                    .send()
+                                                    .await;
+                                                match res {
+                                                    Ok(resp) => {
+                                                        if resp.status().is_success() {
+                                                            if let Ok(data) = resp.json::<serde_json::Value>().await {
+                                                                if let Some(tok) = data.get("auth_token").and_then(|v| v.as_str()) {
+                                                                    new_device_token.set(tok.to_string());
+                                                                }
+                                                            }
+                                                        } else {
+                                                            create_error.set("Failed to create device".to_string());
+                                                        }
+                                                    }
+                                                    Err(e) => create_error.set(e.to_string()),
+                                                }
+                                            });
+                                        }
+                                    },
+                                    "Create Device"
+                                }
                             }
                         } else {
-                            div { style: "font-size: 0.75rem; color: #00bfff; font-weight: bold;", "Device Created!" }
-                            div { style: "font-size: 0.75rem; color: #ccc; margin-top: 0.5rem; line-height: 1.4;", "Install & start the background service on your machine:" }
+                            div { style: "font-size: 0.8125rem; color: #30d158; font-weight: 600;", "Device Created Successfully" }
+                            div { style: "font-size: 0.75rem; color: #bbb; line-height: 1.4;", "Install and run the background service on your machine:" }
                             div { 
-                                style: "font-size: 0.7rem; color: #00ff88; font-family: monospace; word-break: break-all; background-color: #111; padding: 0.6rem; border-radius: 4px; margin-top: 0.5rem; border: 1px solid #333; user-select: all;", 
+                                style: "font-size: 0.75rem; color: #30d158; font-family: monospace; word-break: break-all; background-color: #111; padding: 0.65rem; border-radius: 5px; border: 1px solid #333; user-select: all;", 
                                 "sys_stats service install --token {new_device_token}" 
                             }
-                            div { style: "font-size: 0.68rem; color: #888; margin-top: 0.4rem; line-height: 1.3;", "Supports macOS (launchd), Linux (systemd / OpenRC), and Windows." }
+                            div { style: "font-size: 0.7rem; color: #8e8e93; line-height: 1.3;", "Supports macOS (launchd), Linux (systemd / OpenRC), and Windows." }
                             button {
-                                style: "width: 100%; padding: 0.5rem; background-color: #333; color: #fff; border: 1px solid #444; border-radius: 4px; cursor: pointer; font-size: 0.875rem; margin-top: 0.5rem;",
+                                style: "width: 100%; padding: 0.5rem; background-color: #333; color: #fff; border: 1px solid #444; border-radius: 5px; cursor: pointer; font-size: 0.8125rem; margin-top: 0.5rem;",
                                 onclick: {
                                     let t = props.token.clone();
                                     move |_| {
@@ -674,18 +989,23 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                 div {
                     style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-color: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 1000;",
                     div {
-                        style: "background-color: #252525; padding: 2rem; border-radius: 8px; border: 1px solid #444; width: 100%; max-width: 400px; display: flex; flex-direction: column; gap: 1rem;",
-                        h3 { style: "margin: 0; color: #fff;", "Rename Device" }
+                        style: "background-color: #28282a; padding: 1.75rem; border-radius: 10px; border: 1px solid #3a3a3c; width: 100%; max-width: 380px; display: flex; flex-direction: column; gap: 1rem;",
+                        h3 { style: "margin: 0; color: #fff; font-size: 1rem;", "Rename Device" }
                         input {
                             type: "text",
                             value: "{edit_device_name}",
                             oninput: move |evt| edit_device_name.set(evt.value()),
-                            style: "background-color: #1e1e1e; border: 1px solid #444; color: #fff; padding: 0.5rem; border-radius: 4px;",
+                            style: "background-color: #1c1c1e; border: 1px solid #3a3a3c; color: #fff; padding: 0.5rem; border-radius: 5px; font-size: 0.875rem;",
                         }
                         div {
-                            style: "display: flex; gap: 0.5rem;",
+                            style: "display: flex; justify-content: flex-end; gap: 0.5rem;",
                             button {
-                                style: "flex: 1; padding: 0.5rem; background-color: #007aff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.875rem;",
+                                style: "padding: 0.45rem 0.9rem; background-color: transparent; color: #aaa; border: none; cursor: pointer; font-size: 0.8125rem;",
+                                onclick: move |_| editing_device_id.set(String::new()),
+                                "Cancel"
+                            }
+                            button {
+                                style: "padding: 0.45rem 1rem; background-color: #007aff; color: #fff; border: none; border-radius: 5px; cursor: pointer; font-size: 0.8125rem; font-weight: 500;",
                                 onclick: {
                                     let id = editing_device_id.read().clone();
                                     let name = edit_device_name.read().clone();
@@ -709,255 +1029,53 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                                 },
                                 "Save"
                             }
-                            button {
-                                style: "flex: 1; padding: 0.5rem; background-color: transparent; color: #aaa; border: 1px solid transparent; cursor: pointer; font-size: 0.875rem;",
-                                onclick: move |_| editing_device_id.set(String::new()),
-                                "Cancel"
-                            }
                         }
                     }
                 }
             }
 
-            // Modal: Alert Rules Configuration
-            if *is_alert_modal_open.read() {
-                div {
-                    style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-color: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 1000;",
-                    div {
-                        style: "background-color: #252525; padding: 2rem; border-radius: 8px; border: 1px solid #444; width: 100%; max-width: 550px; max-height: 85vh; display: flex; flex-direction: column; gap: 1.25rem; overflow-y: auto;",
-                        div {
-                            style: "display: flex; justify-content: space-between; align-items: center;",
-                            h3 { style: "margin: 0; color: #fff;", "⚙️ Threshold Alert Rules" }
-                            button {
-                                style: "background: none; border: none; color: #aaa; cursor: pointer; font-size: 1.2rem;",
-                                onclick: move |_| is_alert_modal_open.set(false),
-                                "✕"
-                            }
-                        }
-
-                        // Existing Rules List
-                        div {
-                            style: "display: flex; flex-direction: column; gap: 0.5rem;",
-                            div { style: "font-size: 0.8rem; font-weight: 600; color: #888; text-transform: uppercase;", "Active Rules" }
-                            if alert_rules.read().is_empty() {
-                                div { style: "font-size: 0.85rem; color: #666; font-style: italic;", "No threshold alert rules set yet. Add one below!" }
-                            }
-                            for rule in alert_rules.read().iter() {
-                                div {
-                                    key: "{rule.id}",
-                                    style: "background: #1e1e1e; border: 1px solid #333; padding: 0.75rem; border-radius: 6px; display: flex; justify-content: space-between; align-items: center;",
-                                    div {
-                                        div { style: "font-weight: 600; font-size: 0.9rem; color: #00bfff;", "{rule.metric_type.to_uppercase()} > {rule.threshold_value}%" }
-                                        div { style: "font-size: 0.75rem; color: #888; margin-top: 0.2rem;",
-                                            "Target: "
-                                            {
-                                                if let Some(did) = &rule.device_id {
-                                                    devices.read().iter().find(|d| &d.id == did).map(|d| d.name.clone()).unwrap_or_else(|| "Specific Device".to_string())
-                                                } else {
-                                                    "All Devices".to_string()
-                                                }
-                                            }
-                                            " • Cooldown: {rule.cooldown_seconds / 60}m"
-                                        }
-                                    }
-                                    button {
-                                        style: "background: #331111; border: 1px solid #662222; color: #ff6666; border-radius: 4px; padding: 0.3rem 0.6rem; font-size: 0.75rem; cursor: pointer;",
-                                        onclick: {
-                                            let rid = rule.id.clone();
-                                            let t = props.token.clone();
-                                            move |_| {
-                                                let rid = rid.clone();
-                                                let t = t.clone();
-                                                spawn(async move {
-                                                    let client = reqwest::Client::new();
-                                                    let url = format!("https://backend-api.krequiem.workers.dev/api/alerts/rules/{}", rid);
-                                                    let _ = client.delete(&url).bearer_auth(&t).send().await;
-                                                    if let Ok(res) = client.get("https://backend-api.krequiem.workers.dev/api/alerts/rules").bearer_auth(&t).send().await {
-                                                        if let Ok(data) = res.json::<Vec<AlertRule>>().await {
-                                                            alert_rules.set(data);
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        },
-                                        "Delete"
-                                    }
-                                }
-                            }
-                        }
-
-                        // Add Rule Form
-                        div {
-                            style: "border-top: 1px solid #333; padding-top: 1rem; display: flex; flex-direction: column; gap: 0.75rem;",
-                            div { style: "font-size: 0.8rem; font-weight: 600; color: #888; text-transform: uppercase;", "Create New Threshold Rule" }
-
-                            div {
-                                style: "display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;",
-                                div {
-                                    label { style: "font-size: 0.75rem; color: #aaa;", "Metric" }
-                                    select {
-                                        style: "width: 100%; background: #1e1e1e; border: 1px solid #444; color: #fff; padding: 0.4rem; border-radius: 4px; margin-top: 0.2rem;",
-                                        value: "{new_rule_metric}",
-                                        onchange: move |evt| new_rule_metric.set(evt.value()),
-                                        option { value: "cpu", "CPU Usage (%)" }
-                                        option { value: "memory", "Memory Usage (%)" }
-                                        option { value: "disk", "Disk Usage (%)" }
-                                        option { value: "temperature", "CPU Temperature (°C)" }
-                                    }
-                                }
-                                div {
-                                    label { style: "font-size: 0.75rem; color: #aaa;", "Threshold Value" }
-                                    input {
-                                        type: "number",
-                                        style: "width: 100%; background: #1e1e1e; border: 1px solid #444; color: #fff; padding: 0.4rem; border-radius: 4px; margin-top: 0.2rem;",
-                                        value: "{new_rule_threshold}",
-                                        oninput: move |evt| new_rule_threshold.set(evt.value()),
-                                    }
-                                }
-                            }
-
-                            div {
-                                label { style: "font-size: 0.75rem; color: #aaa;", "Target Device" }
-                                select {
-                                    style: "width: 100%; background: #1e1e1e; border: 1px solid #444; color: #fff; padding: 0.4rem; border-radius: 4px; margin-top: 0.2rem;",
-                                    value: "{new_rule_device_id}",
-                                    onchange: move |evt| new_rule_device_id.set(evt.value()),
-                                    option { value: "", "All Devices (Global)" }
-                                    for dev in devices.read().iter() {
-                                        option { value: "{dev.id}", "{dev.name}" }
-                                    }
-                                }
-                            }
-
-                            div {
-                                style: "display: flex; gap: 1rem; align-items: center;",
-                                label {
-                                    style: "font-size: 0.8rem; color: #ccc; display: flex; align-items: center; gap: 0.4rem; cursor: pointer;",
-                                    input {
-                                        type: "checkbox",
-                                        checked: *new_rule_email.read(),
-                                        onchange: move |_| {
-                                            let cur = *new_rule_email.read();
-                                            new_rule_email.set(!cur);
-                                        }
-                                    }
-                                    "Send Email Alert"
-                                }
-                                label {
-                                    style: "font-size: 0.8rem; color: #ccc; display: flex; align-items: center; gap: 0.4rem; cursor: pointer;",
-                                    input {
-                                        type: "checkbox",
-                                        checked: *new_rule_browser.read(),
-                                        onchange: move |_| {
-                                            let cur = *new_rule_browser.read();
-                                            new_rule_browser.set(!cur);
-                                        }
-                                    }
-                                    "Browser Popup Alert"
-                                }
-                            }
-
-                            if !rule_form_error.read().is_empty() {
-                                div { style: "color: #ff4444; font-size: 0.75rem;", "{rule_form_error}" }
-                            }
-
-                            button {
-                                style: "padding: 0.6rem; background-color: #007aff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.875rem; font-weight: 500; margin-top: 0.5rem;",
-                                onclick: {
-                                    let t = props.token.clone();
-                                    move |_| {
-                                        let thresh: f32 = match new_rule_threshold.read().parse() {
-                                            Ok(v) => v,
-                                            Err(_) => {
-                                                rule_form_error.set("Invalid threshold number".to_string());
-                                                return;
-                                            }
-                                        };
-                                        let metric = new_rule_metric.read().clone();
-                                        let dev_id = new_rule_device_id.read().clone();
-                                        let dev_opt = if dev_id.is_empty() { None } else { Some(dev_id) };
-                                        let cooldown: u32 = new_rule_cooldown.read().parse().unwrap_or(900);
-                                        let email_flag = *new_rule_email.read();
-                                        let browser_flag = *new_rule_browser.read();
-
-                                        let req = CreateAlertRuleRequest {
-                                            device_id: dev_opt,
-                                            metric_type: metric,
-                                            threshold_value: thresh,
-                                            cooldown_seconds: Some(cooldown),
-                                            notify_email: Some(email_flag),
-                                            notify_browser: Some(browser_flag),
-                                        };
-
-                                        let t = t.clone();
-                                        spawn(async move {
-                                            let client = reqwest::Client::new();
-                                            let res = client.post("https://backend-api.krequiem.workers.dev/api/alerts/rules")
-                                                .bearer_auth(&t)
-                                                .json(&req)
-                                                .send()
-                                                .await;
-
-                                            if let Ok(resp) = res {
-                                                if resp.status().is_success() {
-                                                    rule_form_error.set(String::new());
-                                                    if let Ok(res2) = client.get("https://backend-api.krequiem.workers.dev/api/alerts/rules").bearer_auth(&t).send().await {
-                                                        if let Ok(data) = res2.json::<Vec<AlertRule>>().await {
-                                                            alert_rules.set(data);
-                                                        }
-                                                    }
-                                                } else {
-                                                    rule_form_error.set("Failed to create alert rule".to_string());
-                                                }
-                                            }
-                                        });
-                                    }
-                                },
-                                "Add Threshold Rule"
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Modal: Notification History Feed
+            // Modal: Notification History Feed (macOS Notification Drawer)
             if *is_history_modal_open.read() {
                 div {
                     style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-color: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 1000;",
                     div {
-                        style: "background-color: #252525; padding: 2rem; border-radius: 8px; border: 1px solid #444; width: 100%; max-width: 500px; max-height: 80vh; display: flex; flex-direction: column; gap: 1rem;",
+                        style: "background-color: #28282a; padding: 1.75rem; border-radius: 10px; border: 1px solid #3a3a3c; width: 100%; max-width: 480px; max-height: 80vh; display: flex; flex-direction: column; gap: 1rem;",
                         div {
                             style: "display: flex; justify-content: space-between; align-items: center;",
-                            h3 { style: "margin: 0; color: #fff;", "🔔 Alert Notifications" }
+                            h3 { style: "margin: 0; color: #fff; font-size: 1.05rem; font-weight: 600;", "Notifications" }
                             button {
-                                style: "background: none; border: none; color: #aaa; cursor: pointer; font-size: 1.2rem;",
+                                style: "background: none; border: none; color: #8e8e93; cursor: pointer; padding: 0.2rem;",
                                 onclick: move |_| is_history_modal_open.set(false),
-                                "✕"
+                                svg {
+                                    style: "width: 14px; height: 14px; fill: currentColor;",
+                                    view_box: "0 0 24 24",
+                                    path { d: "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" }
+                                }
                             }
                         }
 
                         div {
-                            style: "flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.5rem;",
+                            style: "flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.4rem;",
                             if alert_history.read().is_empty() {
-                                div { style: "font-size: 0.85rem; color: #666; font-style: italic; text-align: center; padding: 2rem;", "No alert notifications yet." }
+                                div { style: "font-size: 0.8125rem; color: #666; font-style: italic; text-align: center; padding: 2rem;", "No alert notifications yet." }
                             }
                             for event in alert_history.read().iter() {
                                 div {
                                     key: "{event.id}",
                                     style: format!(
-                                        "background: {}; border: 1px solid {}; padding: 0.75rem; border-radius: 6px; display: flex; justify-content: space-between; align-items: flex-start;",
-                                        if event.read_at.is_none() { "#2c1a1a" } else { "#1e1e1e" },
-                                        if event.read_at.is_none() { "#ff5555" } else { "#333" }
+                                        "background: {}; border: 1px solid {}; padding: 0.65rem 0.85rem; border-radius: 6px; display: flex; justify-content: space-between; align-items: center;",
+                                        if event.read_at.is_none() { "#281b1b" } else { "#1c1c1e" },
+                                        if event.read_at.is_none() { "#ff453a" } else { "#2c2c2e" }
                                     ),
                                     div {
                                         style: "flex: 1;",
-                                        div { style: "font-weight: 600; font-size: 0.85rem; color: #fff;", "{event.device_name} — {event.metric_type.to_uppercase()}" }
-                                        div { style: "font-size: 0.8rem; color: #ccc; margin-top: 0.2rem;", "{event.message}" }
-                                        div { style: "font-size: 0.7rem; color: #777; margin-top: 0.3rem;", "{event.created_at}" }
+                                        div { style: "font-weight: 600; font-size: 0.8125rem; color: #fff;", "{event.device_name} — {event.metric_type.to_uppercase()}" }
+                                        div { style: "font-size: 0.75rem; color: #ccc; margin-top: 0.15rem;", "{event.message}" }
+                                        div { style: "font-size: 0.68rem; color: #777; margin-top: 0.25rem;", "{event.created_at}" }
                                     }
                                     if event.read_at.is_none() {
                                         button {
-                                            style: "background: #333; border: 1px solid #555; color: #ccc; border-radius: 4px; padding: 0.25rem 0.5rem; font-size: 0.7rem; cursor: pointer;",
+                                            style: "background: #333; border: 1px solid #444; color: #ccc; border-radius: 4px; padding: 0.2rem 0.5rem; font-size: 0.7rem; cursor: pointer; margin-left: 0.5rem;",
                                             onclick: {
                                                 let id = event.id.clone();
                                                 let t = props.token.clone();
@@ -977,6 +1095,77 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                                             },
                                             "Mark Read"
                                         }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Modal: Rules Overview
+            if *is_rules_overview_open.read() {
+                div {
+                    style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-color: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 1000;",
+                    div {
+                        style: "background-color: #28282a; padding: 1.75rem; border-radius: 10px; border: 1px solid #3a3a3c; width: 100%; max-width: 480px; max-height: 80vh; display: flex; flex-direction: column; gap: 1rem;",
+                        div {
+                            style: "display: flex; justify-content: space-between; align-items: center;",
+                            h3 { style: "margin: 0; color: #fff; font-size: 1.05rem; font-weight: 600;", "Active Alert Rules" }
+                            button {
+                                style: "background: none; border: none; color: #8e8e93; cursor: pointer; padding: 0.2rem;",
+                                onclick: move |_| is_rules_overview_open.set(false),
+                                svg {
+                                    style: "width: 14px; height: 14px; fill: currentColor;",
+                                    view_box: "0 0 24 24",
+                                    path { d: "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" }
+                                }
+                            }
+                        }
+
+                        div {
+                            style: "flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.4rem;",
+                            if alert_rules.read().is_empty() {
+                                div { style: "font-size: 0.8125rem; color: #666; font-style: italic; text-align: center; padding: 2rem;", "No alert rules configured. Click any statistic on the dashboard to set one!" }
+                            }
+                            for rule in alert_rules.read().iter() {
+                                div {
+                                    key: "{rule.id}",
+                                    style: "background: #1c1c1e; border: 1px solid #2c2c2e; padding: 0.65rem 0.85rem; border-radius: 6px; display: flex; justify-content: space-between; align-items: center;",
+                                    div {
+                                        div { style: "font-weight: 600; font-size: 0.8125rem; color: #007aff;", "{rule.metric_type.to_uppercase()} > {rule.threshold_value}%" }
+                                        div { style: "font-size: 0.72rem; color: #888; margin-top: 0.15rem;",
+                                            "Target: "
+                                            {
+                                                if let Some(did) = &rule.device_id {
+                                                    devices.read().iter().find(|d| &d.id == did).map(|d| d.name.clone()).unwrap_or_else(|| "Device".to_string())
+                                                } else {
+                                                    "All Devices".to_string()
+                                                }
+                                            }
+                                        }
+                                    }
+                                    button {
+                                        style: "background: none; border: 1px solid #444; color: #ff453a; border-radius: 4px; padding: 0.2rem 0.5rem; font-size: 0.7rem; cursor: pointer;",
+                                        onclick: {
+                                            let rid = rule.id.clone();
+                                            let t = props.token.clone();
+                                            move |_| {
+                                                let rid = rid.clone();
+                                                let t = t.clone();
+                                                spawn(async move {
+                                                    let client = reqwest::Client::new();
+                                                    let url = format!("https://backend-api.krequiem.workers.dev/api/alerts/rules/{}", rid);
+                                                    let _ = client.delete(&url).bearer_auth(&t).send().await;
+                                                    if let Ok(res) = client.get("https://backend-api.krequiem.workers.dev/api/alerts/rules").bearer_auth(&t).send().await {
+                                                        if let Ok(data) = res.json::<Vec<AlertRule>>().await {
+                                                            alert_rules.set(data);
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        },
+                                        "Delete"
                                     }
                                 }
                             }

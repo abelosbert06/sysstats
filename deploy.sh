@@ -9,8 +9,8 @@ echo "Building WebAssembly frontend..."
 cd frontend-app
 ~/.cargo/bin/dx build --platform web --release
 
-echo "Deploying to Cloudflare Pages Production..."
-npx wrangler pages deploy ../target/dx/frontend-app/release/web/public --project-name sysstats-ui --branch=main
+echo "Deploying to Cloudflare Pages Production (master branch)..."
+npx wrangler pages deploy ../target/dx/frontend-app/release/web/public --project-name sysstats-ui --branch=master
 
 echo "========================================"
 echo "Deployment Complete!"

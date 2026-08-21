@@ -430,13 +430,13 @@ pub fn Dashboard(props: DashboardProps) -> Element {
                                     "Cancel"
                                 }
                             } else {
-                                div { style: "font-size: 0.75rem; color: #00bfff; font-weight: bold;", "Device Added!" }
-                                if cfg!(target_arch = "wasm32") {
-                                    div { style: "font-size: 0.7rem; color: #ccc; margin-top: 0.5rem; line-height: 1.4;", "Run the following command on your device to start collecting metrics:" }
-                                    div { style: "font-size: 0.7rem; color: #ccc; word-break: break-all; background-color: #111; padding: 0.5rem; border-radius: 4px; margin-top: 0.5rem;", "./sys_stats --headless --token {new_device_token}" }
-                                } else {
-                                    div { style: "font-size: 0.7rem; color: #ccc; margin-top: 0.5rem; line-height: 1.4;", "Success! This app is now securely linked to your account and will automatically collect background metrics." }
+                                div { style: "font-size: 0.75rem; color: #00bfff; font-weight: bold;", "Device Created!" }
+                                div { style: "font-size: 0.75rem; color: #ccc; margin-top: 0.5rem; line-height: 1.4;", "Install & start the background service on your machine:" }
+                                div { 
+                                    style: "font-size: 0.7rem; color: #00ff88; font-family: monospace; word-break: break-all; background-color: #111; padding: 0.6rem; border-radius: 4px; margin-top: 0.5rem; border: 1px solid #333; user-select: all;", 
+                                    "sys_stats service install --token {new_device_token}" 
                                 }
+                                div { style: "font-size: 0.68rem; color: #888; margin-top: 0.4rem; line-height: 1.3;", "Supports macOS (launchd), Linux (systemd / OpenRC), and Windows." }
                                 button {
                                     style: "width: 100%; padding: 0.5rem; background-color: #333; color: #fff; border: 1px solid #444; border-radius: 4px; cursor: pointer; font-size: 0.875rem; margin-top: 0.5rem;",
                                     onclick: {

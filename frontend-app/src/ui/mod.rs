@@ -24,11 +24,6 @@ pub fn App() -> Element {
                 dashboard::Dashboard { 
                     token: token.clone(),
                     on_logout: move |_| {
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            let _ = crate::local_db::desktop::delete_device_token();
-                            crate::collector::desktop::set_device_token(String::new());
-                        }
                         auth_state.set(AuthState::Unauthenticated);
                     }
                 }
